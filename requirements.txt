@@ -9,3 +9,4 @@ streamlit
 python-dotenv
 pillow
 fastembed
+datasets
