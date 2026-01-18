@@ -14,11 +14,13 @@ try:
 except ImportError:
     from src.config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
 
+# --- 2. CACHED TOOLS ---
 @st.cache_resource
 def get_ai_tools():
+    # LLM (Fixed Model Name)
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GOOGLE_API_KEY)
     
-    # Client with increased timeout
+    # Qdrant Client (High Timeout)
     client = QdrantClient(
         url=QDRANT_URL, 
         api_key=QDRANT_API_KEY, 
@@ -26,7 +28,7 @@ def get_ai_tools():
         timeout=60
     )
     
-    # Models
+    # Embedding Model
     encoder = SentenceTransformer(EMBEDDING_MODEL)
     
     return llm, client, encoder
@@ -55,38 +57,38 @@ def intake_router(state: AgentState):
         return {"current_agent": "senior_counsel"}
 
 def legal_clerk(state: AgentState):
-    """Agent B: Robust Hybrid Search."""
+    """
+    Agent B: Research Agent using Modern 'query_points' API.
+    """
     query = state['messages'][-1]
     
     try:
-        # 1. Generate Dense Vector
-        dense_vector = encoder.encode(query).tolist()
+        # 1. Generate Vector
+        query_vector = encoder.encode(query).tolist()
         
-        # 2. Perform Search (Using 'Safe Tuple' Syntax)
-        hits = client.search(
+        # 2. Search using query_points (The New Standard)
+        # This replaces client.search() and avoids the AttributeError
+        hits = client.query_points(
             collection_name="legal_knowledge",
-            query_vector=("dense", dense_vector), 
+            query=query_vector,   # In new API, we just pass the vector to 'query'
+            using="dense",        # Explicitly tell it to use the 'dense' vector
             limit=5,
             with_payload=True
-        )
+        ).points  # Note: query_points returns an object with a .points attribute
         
         if not hits:
             return {"context_data": "No matches found.", "messages": ["I checked the legal database but found no direct matches."]}
 
-        # Format results
+        # 3. Format Results
         results = []
         for hit in hits:
-            # Handle variable payload structure
-            act = hit.payload.get('act', 'Act')
-            section = hit.payload.get('section', '?')
-            # Look for 'full_text' first, then 'text', then 'law'
+            # Handle payload robustly
             text = hit.payload.get('full_text') or hit.payload.get('text') or hit.payload.get('law') or ""
             results.append(f"- {text}")
             
         return {"context_data": "\n".join(results), "messages": [f"I found {len(hits)} relevant legal precedents."]}
 
     except Exception as e:
-        print(f"SEARCH ERROR: {e}")
         return {"context_data": f"Database Error: {e}", "messages": ["I am having trouble accessing the legal archives momentarily."]}
 
 def evidence_auditor(state: AgentState):
@@ -106,8 +108,8 @@ def senior_counsel(state: AgentState):
     
     INSTRUCTIONS:
     1. Answer using ONLY the provided Legal Evidence.
-    2. Cite the specific Acts and Sections mentioned in the evidence.
-    3. If the evidence is missing, ask for clarification.
+    2. Cite the specific Acts and Sections mentioned.
+    3. If evidence is missing, state general principles but warn the user.
     """
     response = llm.invoke(prompt)
     return {"messages": [response.content]}
