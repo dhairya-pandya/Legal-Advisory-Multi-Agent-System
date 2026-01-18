@@ -25,7 +25,42 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+This is the execution phase. We are building the Production-Ready "Justitia" MAS.
 
+We will write clean, modular code that uses environment variables for security (essential for deployment) and includes error handling.
+
+Phase 1: Project Skeleton & Configuration
+Create a folder named Justitia_MAS. Inside it, create the following structure exactly.
+
+Plaintext
+Justitia_MAS/
+├── .env                  <-- Secrets (API Keys)
+├── .gitignore            <-- Security rules
+├── docker-compose.yml    <-- Database Infrastructure
+├── requirements.txt      <-- Dependencies
+└── src/
+    ├── __init__.py       <-- Makes this a package
+    ├── config.py         <-- Configuration Manager
+    ├── setup_qdrant.py   <-- Database Initializer
+    ├── ingest.py         <-- Knowledge Loader
+    ├── agents.py         <-- The Brain (LangGraph)
+    └── app.py            <-- The Interface (Streamlit)
+Phase 2: The Files (Copy-Paste Execution)
+1. .env (Create this file in the root)
+Action: Replace the values with your actual keys.
+
+Ini, TOML
+GOOGLE_API_KEY=your_actual_gemini_key_here
+# Leave these as is for local development; update for cloud deployment
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=
+2. .gitignore
+Action: Prevents you from accidentally leaking secrets to GitHub.
+
+.env
+__pycache__/
+qdrant_storage/
+*.pyc
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
