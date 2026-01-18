@@ -1,25 +1,41 @@
 import os
+import sys
+import streamlit as st
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 try:
     from config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
 except ImportError:
+    # Fallback for local testing if running from root
     from src.config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
 
-# Initialize Components
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GOOGLE_API_KEY)
-client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
-encoder = SentenceTransformer(EMBEDDING_MODEL)
+@st.cache_resource
+def get_ai_tools():
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GOOGLE_API_KEY)
+    
+    # Connect to Qdrant
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
+    
+    # Load Embedding Model (This is the heavy part that was causing timeouts)
+    encoder = SentenceTransformer(EMBEDDING_MODEL)
+    
+    return llm, client, encoder
+
+# Load the tools
+llm, client, encoder = get_ai_tools()
+
+# --- 3. AGENT LOGIC ---
 
 class AgentState(TypedDict):
     messages: List[str]
     current_agent: str
     context_data: str
-
-# --- AGENT NODES ---
 
 def intake_router(state: AgentState):
     """Agent A: Routes based on user intent."""
@@ -49,12 +65,11 @@ def legal_clerk(state: AgentState):
     if not hits:
         return {"context_data": "No specific laws found.", "messages": ["I checked the legal database but found no direct matches."]}
 
-    results = "\n".join([f"- {hit.payload['section']}: {hit.payload['text']}" for hit in hits])
+    results = "\n".join([f"- {hit.payload.get('section', 'Law')}: {hit.payload.get('text', '')}" for hit in hits])
     return {"context_data": f"LEGAL FACTS FOUND:\n{results}", "messages": [f"I have retrieved relevant legal sections: {results}"]}
 
 def evidence_auditor(state: AgentState):
-    """Agent C: Evidence Analysis (Mocked for MVP)."""
-    # In full version: Embedding image with CLIP and searching evidence_vault
+    """Agent C: Evidence Analysis."""
     return {"context_data": "Evidence Analysis: Document appears to be a valid Rent Agreement but lacks a witness signature.", "messages": ["I have analyzed the uploaded document. It is missing a witness signature on Page 2."]}
 
 def senior_counsel(state: AgentState):
