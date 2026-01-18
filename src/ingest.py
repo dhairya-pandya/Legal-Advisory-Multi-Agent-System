@@ -1,6 +1,9 @@
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
-from src.config import QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
+try:
+    from config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
+except ImportError:
+    from src.config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
 
 def load_data():
     # FIX: Force HTTP here too
