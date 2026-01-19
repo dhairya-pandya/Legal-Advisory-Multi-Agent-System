@@ -15,19 +15,56 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 import pypdf
 import docx
 
-# --- 1. CONFIG SETUP ---
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-try:
-    from config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
-except ImportError:
-    from src.config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
+# --- 1. CREDENTIALS & CONFIG SETUP (The Fix) ---
+def get_credentials():
+    """
+    Robustly fetch credentials from Config file OR Streamlit Secrets OR Environment.
+    """
+    creds = {}
+    
+    # Try loading from local config.py
+    try:
+        import config
+        creds["GOOGLE_API_KEY"] = getattr(config, "GOOGLE_API_KEY", None)
+        creds["QDRANT_URL"] = getattr(config, "QDRANT_URL", None)
+        creds["QDRANT_API_KEY"] = getattr(config, "QDRANT_API_KEY", None)
+        creds["EMBEDDING_MODEL"] = getattr(config, "EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    except ImportError:
+        pass
+
+    # Fallback: Streamlit Secrets (Production)
+    if not creds.get("GOOGLE_API_KEY"):
+        try:
+            creds["GOOGLE_API_KEY"] = st.secrets.get("GOOGLE_API_KEY")
+            creds["QDRANT_URL"] = st.secrets.get("QDRANT_URL")
+            creds["QDRANT_API_KEY"] = st.secrets.get("QDRANT_API_KEY")
+            creds["EMBEDDING_MODEL"] = st.secrets.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        except FileNotFoundError:
+            pass
+            
+    # Fallback: OS Environment
+    if not creds.get("GOOGLE_API_KEY"):
+        creds["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
+        creds["QDRANT_URL"] = os.getenv("QDRANT_URL")
+        creds["QDRANT_API_KEY"] = os.getenv("QDRANT_API_KEY")
+        creds["EMBEDDING_MODEL"] = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+    return creds
+
+# Load Creds
+CREDS = get_credentials()
+
+# Stop if keys are missing (Prevents "NoneType" errors downstream)
+if not CREDS["GOOGLE_API_KEY"] or not CREDS["QDRANT_URL"]:
+    st.error("🚨 Configuration Error: API Keys not found. Please check config.py or Streamlit Secrets.")
+    st.stop()
 
 # --- 2. CACHED TOOLS ---
 @st.cache_resource
 def get_ai_tools():
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash", # <--- FIX: Correct Model Name
-        google_api_key=GOOGLE_API_KEY,
+        model="gemini-2.5-flash", 
+        google_api_key=CREDS["GOOGLE_API_KEY"],
         temperature=0.3,
         safety_settings={
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
@@ -36,8 +73,8 @@ def get_ai_tools():
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
         }
     )
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False, timeout=60)
-    encoder = SentenceTransformer(EMBEDDING_MODEL)
+    client = QdrantClient(url=CREDS["QDRANT_URL"], api_key=CREDS["QDRANT_API_KEY"], prefer_grpc=False, timeout=60)
+    encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
     ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank")
     return llm, client, encoder, ranker
 
@@ -49,14 +86,14 @@ class AgentState(TypedDict):
     context_data: Annotated[List[str], operator.add] 
     file_data: Optional[dict]
 
-# --- 4. NODES & ROUTING (The Split Fix) ---
+# --- 4. NODES & ROUTING ---
 
 def intake(state: AgentState):
-    """Dummy Entry Node - Must return a Dict"""
+    """Dummy Entry Node"""
     return {} 
 
 def route_logic(state: AgentState) -> List[str]:
-    """Router Logic - Returns List of Agent Names"""
+    """Router Logic"""
     agents_to_run = []
     
     if state['messages']:
@@ -93,9 +130,8 @@ def legal_clerk(state: AgentState):
         passages = [{"id": h.id, "text": h.payload.get('full_text', '')} for h in hits]
         results = ranker.rerank(RerankRequest(query=query, passages=passages))
         
-        # FIX: Safety check if rerank returns None
         if not results: 
-            return {"context_data": ["Legal Clerk: Reranking found no relevant matches."]}
+            return {"context_data": ["Legal Clerk: Reranking found no matches."]}
 
         final_results = []
         for res in results[:5]:
