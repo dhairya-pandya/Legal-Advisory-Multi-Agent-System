@@ -10,19 +10,12 @@ from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, H
 from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
-from flashrank import Ranker, RerankRequest
-from tenacity import retry, stop_after_attempt, wait_random_exponential
 import pypdf
 import docx
 
-# --- 1. CREDENTIALS & CONFIG SETUP (The Fix) ---
+# --- 1. CREDENTIALS & CONFIG ---
 def get_credentials():
-    """
-    Robustly fetch credentials from Config file OR Streamlit Secrets OR Environment.
-    """
     creds = {}
-    
-    # Try loading from local config.py
     try:
         import config
         creds["GOOGLE_API_KEY"] = getattr(config, "GOOGLE_API_KEY", None)
@@ -31,32 +24,19 @@ def get_credentials():
         creds["EMBEDDING_MODEL"] = getattr(config, "EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     except ImportError:
         pass
-
-    # Fallback: Streamlit Secrets (Production)
+        
     if not creds.get("GOOGLE_API_KEY"):
-        try:
-            creds["GOOGLE_API_KEY"] = st.secrets.get("GOOGLE_API_KEY")
-            creds["QDRANT_URL"] = st.secrets.get("QDRANT_URL")
-            creds["QDRANT_API_KEY"] = st.secrets.get("QDRANT_API_KEY")
-            creds["EMBEDDING_MODEL"] = st.secrets.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-        except FileNotFoundError:
-            pass
-            
-    # Fallback: OS Environment
-    if not creds.get("GOOGLE_API_KEY"):
-        creds["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
-        creds["QDRANT_URL"] = os.getenv("QDRANT_URL")
-        creds["QDRANT_API_KEY"] = os.getenv("QDRANT_API_KEY")
-        creds["EMBEDDING_MODEL"] = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        creds["GOOGLE_API_KEY"] = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY"))
+        creds["QDRANT_URL"] = st.secrets.get("QDRANT_URL", os.getenv("QDRANT_URL"))
+        creds["QDRANT_API_KEY"] = st.secrets.get("QDRANT_API_KEY", os.getenv("QDRANT_API_KEY"))
+        creds["EMBEDDING_MODEL"] = st.secrets.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
     return creds
 
-# Load Creds
 CREDS = get_credentials()
 
-# Stop if keys are missing (Prevents "NoneType" errors downstream)
 if not CREDS["GOOGLE_API_KEY"] or not CREDS["QDRANT_URL"]:
-    st.error("🚨 Configuration Error: API Keys not found. Please check config.py or Streamlit Secrets.")
+    st.error("🚨 Configuration Error: API Keys not found.")
     st.stop()
 
 # --- 2. CACHED TOOLS ---
@@ -75,14 +55,14 @@ def get_ai_tools():
     )
     client = QdrantClient(url=CREDS["QDRANT_URL"], api_key=CREDS["QDRANT_API_KEY"], prefer_grpc=False, timeout=60)
     encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
-    ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank")
-    return llm, client, encoder, ranker
+    return llm, client, encoder
 
-llm, client, encoder, ranker = get_ai_tools()
+llm, client, encoder = get_ai_tools()
 
 # --- 3. AGENT STATE ---
 class AgentState(TypedDict):
     messages: List[str]
+    # operator.add merges lists. We must ensure NO agent returns None for this key.
     context_data: Annotated[List[str], operator.add] 
     file_data: Optional[dict]
 
@@ -96,9 +76,11 @@ def route_logic(state: AgentState) -> List[str]:
     """Router Logic"""
     agents_to_run = []
     
-    if state['messages']:
+    # Check messages safely
+    if state.get('messages') and len(state['messages']) > 0:
         agents_to_run.append("legal_clerk")
         
+    # Check file data safely
     if state.get("file_data"):
         agents_to_run.append("evidence_auditor")
 
@@ -110,71 +92,70 @@ def route_logic(state: AgentState) -> List[str]:
 # --- 5. AGENTS ---
 
 def legal_clerk(state: AgentState):
-    if not state['messages']:
+    """Retrieves Legal Context (Standard Search)."""
+    # Defensive check
+    if not state.get('messages'):
         return {"context_data": []}
         
     query = state['messages'][-1].split("User: ")[-1]
     
     try:
+        # 1. Search (Dense Vector)
         hits = client.query_points(
             collection_name="legal_knowledge",
             query=encoder.encode(query).tolist(),
             using="dense",
-            limit=15, 
+            limit=5, # Reduced limit since we removed Reranker
             with_payload=True
         ).points
         
         if not hits:
             return {"context_data": ["Legal Clerk: No specific laws found."]}
 
-        passages = [{"id": h.id, "text": h.payload.get('full_text', '')} for h in hits]
-        results = ranker.rerank(RerankRequest(query=query, passages=passages))
-        
-        if not results: 
-            return {"context_data": ["Legal Clerk: Reranking found no matches."]}
-
+        # 2. Format Results (Directly, no Reranker)
         final_results = []
-        for res in results[:5]:
-            if res['score'] > 0.4:
-                final_results.append(f"- [Rel: {res['score']:.2f}] {res['text']}")
-        
-        if not final_results:
-             return {"context_data": ["Legal Clerk: Found laws but low relevance."]}
+        for hit in hits:
+            # Robust payload access
+            text = hit.payload.get('full_text') or hit.payload.get('text') or "No Text Available"
+            final_results.append(f"- {text}")
             
         combined_text = "LEGAL PRECEDENTS FOUND:\n" + "\n".join(final_results)
+        
+        # CRITICAL: Always return a LIST
         return {"context_data": [combined_text]}
 
     except Exception as e:
-        return {"context_data": [f"Legal Clerk Error: {e}"]}
-
-@retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(3))
-def robust_llm_invoke(messages):
-    return llm.invoke(messages)
+        # Return error as context so the graph doesn't crash
+        return {"context_data": [f"Legal Clerk Error: {str(e)}"]}
 
 def evidence_auditor(state: AgentState):
+    """Analyzes Files."""
     file_data = state.get("file_data")
     if not file_data:
         return {"context_data": []}
 
-    file_name = file_data["name"]
-    file_type = file_data["type"]
-    file_bytes = file_data["bytes"]
+    file_name = file_data.get("name", "Unknown")
+    file_type = file_data.get("type", "")
+    file_bytes = file_data.get("bytes")
     
     try:
+        # IMAGE HANDLER
         if "image" in file_type or file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
             b64_image = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[
                 {"type": "text", "text": "Forensic Analysis: 1. Transcribe text. 2. Flag issues."},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
             ])
-            response = robust_llm_invoke([msg])
+            response = llm.invoke([msg])
             return {"context_data": [f"EVIDENCE ANALYSIS ({file_name}):\n{response.content}"]}
 
+        # PDF HANDLER
         elif "pdf" in file_type:
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
-            text = "\n".join([p.extract_text() for p in pdf.pages])
+            text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
             return {"context_data": [f"FILE TEXT ({file_name}):\n{text[:5000]}"]}
             
+        # DOCX HANDLER
         elif "word" in file_type:
             doc = docx.Document(io.BytesIO(file_bytes))
             text = "\n".join([p.text for p in doc.paragraphs])
@@ -183,12 +164,18 @@ def evidence_auditor(state: AgentState):
         return {"context_data": ["Evidence Auditor: Unsupported file type."]}
 
     except Exception as e:
-        return {"context_data": [f"Evidence Auditor Error: {e}"]}
+        return {"context_data": [f"Evidence Auditor Error: {str(e)}"]}
 
 def senior_counsel(state: AgentState):
-    history = state['messages']
+    """Synthesizes Final Answer."""
+    history = state.get('messages', [])
+    
+    # Safe access to context_data
     context_list = state.get('context_data', [])
-    full_evidence = "\n\n".join(context_list) if context_list else "No evidence provided."
+    # Ensure it's a list before joining
+    if context_list is None: context_list = []
+    
+    full_evidence = "\n\n".join([str(c) for c in context_list]) if context_list else "No evidence provided."
     
     prompt = f"""
     You are 'Justitia', a sharp AI Legal Co-Counsel.
@@ -199,15 +186,14 @@ def senior_counsel(state: AgentState):
     {full_evidence}
     
     INSTRUCTIONS:
-    1. Answer directly.
-    2. Synthesize findings from ALL evidence.
-    3. If the user's document contradicts the law, point it out.
+    1. Answer directly and concisely.
+    2. Cite specific laws/sections from the evidence.
     """
     try:
-        response = robust_llm_invoke(prompt)
+        response = llm.invoke(prompt)
         return {"messages": [response.content]}
     except Exception as e:
-        return {"messages": [f"Error generating advice: {e}"]}
+        return {"messages": [f"Error generating advice: {str(e)}"]}
 
 # --- 6. WORKFLOW ---
 workflow = StateGraph(AgentState)
