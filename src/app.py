@@ -7,6 +7,7 @@ st.set_page_config(page_title="Justitia AI", page_icon="⚖️")
 st.title("⚖️ Justitia: AI Legal Co-Counsel")
 st.markdown("### Democratizing Access to Justice in India")
 
+# Sidebar for Traceability
 st.sidebar.header("⚙️ Agent Activity Log")
 st.sidebar.info("This panel visualizes the Multi-Agent decision path.")
 
@@ -26,7 +27,7 @@ for msg in st.session_state["messages"]:
         st.write(msg["content"])
 
 # Input Area
-user_input = st.chat_input("Describe your legal issue...")
+user_input = st.chat_input("Describe your legal issue (e.g., 'Check this contract for errors')...")
 
 if user_input:
     # 1. Handle User Input
@@ -34,43 +35,32 @@ if user_input:
     with st.chat_message("user"):
         st.write(user_input)
 
-    # Convert session state to list
+    # --- THE MEMORY FIX ---
+    # Convert session state (JSON) into a list of strings for the Agent
+    # Format: ["User: Hi", "AI: Hello", "User: My landlord..."]
     chat_history = []
     for msg in st.session_state["messages"]:
         role = "User" if msg["role"] == "user" else "AI"
         chat_history.append(f"{role}: {msg['content']}")
 
-    # --- THE FIX: Initialize context_data as empty list ---
-    inputs = {
-        "messages": chat_history,
-        "context_data": []  # <--- CRITICAL FIX for Parallel Logic
-    }
+    # 2. Prepare Inputs (Sending FULL History now)
+    inputs = {"messages": chat_history}
     
     # 3. Handle File Upload
     if uploaded_file:
         file_bytes = uploaded_file.getvalue()
         file_type = uploaded_file.type
         file_name = uploaded_file.name
-        
-        inputs["file_data"] = {
-            "name": file_name,
-            "type": file_type,
-            "bytes": file_bytes
-        }
-        st.sidebar.success(f"📎 Attached: {file_name}")
-
-    # 4. Run the Agent Graph
     with st.spinner("Justitia Agents are collaborating..."):
         final_response = ""
         try:
             for output in agent_app.stream(inputs):
                 for agent_name, agent_state in output.items():
+                    # Traceability in Sidebar
                     with st.sidebar.expander(f"🔹 Active: {agent_name}", expanded=True):
                         st.write(f"**State:** Processing...")
-                        # Handle list output from parallel agents
-                        if "context_data" in agent_state and agent_state["context_data"]:
-                            # It's a list now, so join it or take the last update
-                            preview = str(agent_state["context_data"][-1])[:300] + "..."
+                        if "context_data" in agent_state:
+                            preview = agent_state["context_data"][:300] + "..." if len(agent_state["context_data"]) > 300 else agent_state["context_data"]
                             st.info(f"**Insight:** {preview}")
                     
                     if "messages" in agent_state:

@@ -2,49 +2,30 @@ import os
 import sys
 import io
 import base64
-import operator
 import streamlit as st
-from typing import TypedDict, List, Optional, Annotated
+from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
 from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import pypdf
 import docx
 
-# --- 1. CREDENTIALS & CONFIG ---
-def get_credentials():
-    creds = {}
-    try:
-        import config
-        creds["GOOGLE_API_KEY"] = getattr(config, "GOOGLE_API_KEY", None)
-        creds["QDRANT_URL"] = getattr(config, "QDRANT_URL", None)
-        creds["QDRANT_API_KEY"] = getattr(config, "QDRANT_API_KEY", None)
-        creds["EMBEDDING_MODEL"] = getattr(config, "EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-    except ImportError:
-        pass
-        
-    if not creds.get("GOOGLE_API_KEY"):
-        creds["GOOGLE_API_KEY"] = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY"))
-        creds["QDRANT_URL"] = st.secrets.get("QDRANT_URL", os.getenv("QDRANT_URL"))
-        creds["QDRANT_API_KEY"] = st.secrets.get("QDRANT_API_KEY", os.getenv("QDRANT_API_KEY"))
-        creds["EMBEDDING_MODEL"] = st.secrets.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-
-    return creds
-
-CREDS = get_credentials()
-
-if not CREDS["GOOGLE_API_KEY"] or not CREDS["QDRANT_URL"]:
-    st.error("🚨 Configuration Error: API Keys not found.")
-    st.stop()
+# --- 1. CONFIG SETUP ---
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
+except ImportError:
+    from src.config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
 
 # --- 2. CACHED TOOLS ---
 @st.cache_resource
 def get_ai_tools():
+    # 1. LLM: Gemini 1.5 Flash (Vision Enabled + Safety Disabled)
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash", 
-        google_api_key=CREDS["GOOGLE_API_KEY"],
+        google_api_key=GOOGLE_API_KEY,
         temperature=0.3,
         safety_settings={
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
@@ -53,163 +34,172 @@ def get_ai_tools():
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
         }
     )
-    client = QdrantClient(url=CREDS["QDRANT_URL"], api_key=CREDS["QDRANT_API_KEY"], prefer_grpc=False, timeout=60)
-    encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
-    return llm, client, encoder
+    
+    # 2. Database: Qdrant
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False, timeout=60)
+    
+    # 3. Search Models
+    encoder = SentenceTransformer(EMBEDDING_MODEL)
+    reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2') 
+    
+    return llm, client, encoder, reranker
 
-llm, client, encoder = get_ai_tools()
+llm, client, encoder, reranker = get_ai_tools()
 
 # --- 3. AGENT STATE ---
 class AgentState(TypedDict):
     messages: List[str]
-    # operator.add merges lists. We must ensure NO agent returns None for this key.
-    context_data: Annotated[List[str], operator.add] 
-    file_data: Optional[dict]
+    current_agent: str
+    context_data: str
+    file_data: Optional[dict] # Holds the uploaded file bytes
 
-# --- 4. NODES & ROUTING ---
+# --- 4. AGENTS ---
 
-def intake(state: AgentState):
-    """Dummy Entry Node"""
-    return {} 
-
-def route_logic(state: AgentState) -> List[str]:
-    """Router Logic"""
-    agents_to_run = []
-    
-    # Check messages safely
-    if state.get('messages') and len(state['messages']) > 0:
-        agents_to_run.append("legal_clerk")
-        
-    # Check file data safely
+def intake_router(state: AgentState):
+    """Routes based on File Upload OR Keywords."""
+    # PRIORITY: If a file is uploaded, go straight to the Auditor
     if state.get("file_data"):
-        agents_to_run.append("evidence_auditor")
+        return {"current_agent": "evidence_auditor"}
 
-    if not agents_to_run:
-        return ["senior_counsel"]
-        
-    return agents_to_run
-
-# --- 5. AGENTS ---
+    if not state['messages']:
+        return {"current_agent": "senior_counsel"}
+    
+    last_msg = state['messages'][-1].lower()
+    
+    if any(x in last_msg for x in ["law", "section", "act", "punishment", "ipc", "rights", "crime", "court", "arrest", "police"]):
+        return {"current_agent": "legal_clerk"}
+    else:
+        return {"current_agent": "senior_counsel"}
 
 def legal_clerk(state: AgentState):
-    """Retrieves Legal Context (Standard Search)."""
-    # Defensive check
-    if not state.get('messages'):
-        return {"context_data": []}
-        
-    query = state['messages'][-1].split("User: ")[-1]
+    """Agent B: Research Agent (Search + Rerank)."""
+    query = state['messages'][-1]
     
     try:
-        # 1. Search (Dense Vector)
+        # Broad Search (Dense)
         hits = client.query_points(
             collection_name="legal_knowledge",
             query=encoder.encode(query).tolist(),
             using="dense",
-            limit=5, # Reduced limit since we removed Reranker
+            limit=15, 
             with_payload=True
         ).points
         
         if not hits:
-            return {"context_data": ["Legal Clerk: No specific laws found."]}
+            return {"context_data": "No matches found.", "messages": ["No specific laws found in database."]}
 
-        # 2. Format Results (Directly, no Reranker)
-        final_results = []
-        for hit in hits:
-            # Robust payload access
-            text = hit.payload.get('full_text') or hit.payload.get('text') or "No Text Available"
-            final_results.append(f"- {text}")
-            
-        combined_text = "LEGAL PRECEDENTS FOUND:\n" + "\n".join(final_results)
+        # Rerank Results
+        docs = [hit.payload.get('full_text', hit.payload.get('text', '')) for hit in hits]
+        scores = reranker.predict([[query, doc] for doc in docs])
+        ranked_hits = sorted(zip(scores, hits), key=lambda x: x[0], reverse=True)
         
-        # CRITICAL: Always return a LIST
-        return {"context_data": [combined_text]}
+        # Filter Top Results
+        final_results = []
+        for score, hit in ranked_hits[:5]:
+            if score > 0.01:
+                text = hit.payload.get('full_text', hit.payload.get('text', ''))
+                final_results.append(f"- [Rel: {score:.2f}] {text}")
+        
+        if not final_results:
+             return {"context_data": "Low relevance.", "messages": ["I searched but found no relevant laws."]}
+            
+        return {"context_data": "\n".join(final_results), "messages": [f"Found {len(final_results)} relevant legal precedents."]}
 
     except Exception as e:
-        # Return error as context so the graph doesn't crash
-        return {"context_data": [f"Legal Clerk Error: {str(e)}"]}
+        return {"context_data": f"Error: {e}", "messages": ["Database access error."]}
 
 def evidence_auditor(state: AgentState):
-    """Analyzes Files."""
+    """
+    Agent C: The Vision & Document Specialist.
+    Handles PNG/JPG (Gemini Vision), PDF (PyPDF), Docx (Python-Docx).
+    """
     file_data = state.get("file_data")
     if not file_data:
-        return {"context_data": []}
+        return {"context_data": "No file.", "messages": ["No file was uploaded."]}
 
-    file_name = file_data.get("name", "Unknown")
-    file_type = file_data.get("type", "")
-    file_bytes = file_data.get("bytes")
+    file_name = file_data["name"]
+    file_type = file_data["type"]
+    file_bytes = file_data["bytes"]
     
-    try:
-        # IMAGE HANDLER
-        if "image" in file_type or file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-            b64_image = base64.b64encode(file_bytes).decode('utf-8')
-            msg = HumanMessage(content=[
-                {"type": "text", "text": "Forensic Analysis: 1. Transcribe text. 2. Flag issues."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-            ])
-            response = llm.invoke([msg])
-            return {"context_data": [f"EVIDENCE ANALYSIS ({file_name}):\n{response.content}"]}
+    extracted_content = ""
 
-        # PDF HANDLER
-        elif "pdf" in file_type:
-            pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
-            text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-            return {"context_data": [f"FILE TEXT ({file_name}):\n{text[:5000]}"]}
+    try:
+        # --- HANDLER 1: IMAGES (Vision Analysis) ---
+        if "image" in file_type or file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+            # Encode for Gemini
+            b64_image = base64.b64encode(file_bytes).decode('utf-8')
             
-        # DOCX HANDLER
-        elif "word" in file_type:
+            message = HumanMessage(
+                content=[
+                    {"type": "text", "text": "You are a Forensic Document Examiner. Analyze this image. 1. Transcribe the text. 2. Describe signatures/stamps. 3. Flag any issues."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                ]
+            )
+            response = llm.invoke([message])
+            extracted_content = f"[IMAGE ANALYSIS]:\n{response.content}"
+
+        # --- HANDLER 2: PDF (Text Extraction) ---
+        elif "pdf" in file_type or file_name.lower().endswith('.pdf'):
+            pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            
+            if len(text.strip()) < 50:
+                 extracted_content = f"[PDF SCAN DETECTED]: The file '{file_name}' seems to be a scan. For best results, convert to JPG and upload again."
+            else:
+                 extracted_content = f"[PDF TEXT]:\n{text}"
+
+        # --- HANDLER 3: DOCX (Text Extraction) ---
+        elif "word" in file_type or file_name.lower().endswith('.docx'):
             doc = docx.Document(io.BytesIO(file_bytes))
-            text = "\n".join([p.text for p in doc.paragraphs])
-            return {"context_data": [f"FILE TEXT ({file_name}):\n{text[:5000]}"]}
+            text = "\n".join([para.text for para in doc.paragraphs])
+            extracted_content = f"[DOCX TEXT]:\n{text}"
             
-        return {"context_data": ["Evidence Auditor: Unsupported file type."]}
+        else:
+            return {"context_data": "Unsupported file.", "messages": ["File type not supported."]}
+
+        return {
+            "context_data": extracted_content[:4000], # Keep context manageable
+            "messages": [f"I have successfully analyzed the file '{file_name}'."]
+        }
 
     except Exception as e:
-        return {"context_data": [f"Evidence Auditor Error: {str(e)}"]}
+        return {"context_data": f"File Error: {e}", "messages": ["Failed to process the file."]}
 
 def senior_counsel(state: AgentState):
-    """Synthesizes Final Answer."""
-    history = state.get('messages', [])
-    
-    # Safe access to context_data
-    context_list = state.get('context_data', [])
-    # Ensure it's a list before joining
-    if context_list is None: context_list = []
-    
-    full_evidence = "\n\n".join([str(c) for c in context_list]) if context_list else "No evidence provided."
+    """Agent D: Final Advice Generator."""
+    history = state['messages']
+    context = state.get('context_data', 'No context.')
     
     prompt = f"""
-    You are 'Justitia', a sharp AI Legal Co-Counsel.
+    You are 'Justitia', a sharp and direct AI Legal Co-Counsel.
     
     USER QUERY: {history}
-    
-    COMBINED EVIDENCE:
-    {full_evidence}
+    EVIDENCE / FILE ANALYSIS: {context}
     
     INSTRUCTIONS:
-    1. Answer directly and concisely.
-    2. Cite specific laws/sections from the evidence.
+    1. **ANSWER THE USER DIRECTLY FIRST.** (e.g., "No, it is illegal because...", "Yes, provided that...").
+    2. Support your answer using the File Analysis or Legal Evidence provided.
+    3. If the user contradicts a document they uploaded (like asking if they can rag juniors after signing an anti-ragging affidavit), call out the contradiction firmly but professionally.
+    4. Cite specific Clauses/Sections found in the evidence.
     """
     try:
         response = llm.invoke(prompt)
         return {"messages": [response.content]}
     except Exception as e:
-        return {"messages": [f"Error generating advice: {str(e)}"]}
+        return {"messages": [f"Error generating advice: {e}"]}
 
-# --- 6. WORKFLOW ---
+# --- 5. WORKFLOW ---
 workflow = StateGraph(AgentState)
-workflow.add_node("intake", intake)
+workflow.add_node("intake", intake_router)
 workflow.add_node("legal_clerk", legal_clerk)
 workflow.add_node("evidence_auditor", evidence_auditor)
 workflow.add_node("senior_counsel", senior_counsel)
 
 workflow.set_entry_point("intake")
-
-workflow.add_conditional_edges(
-    "intake",
-    route_logic, 
-    ["legal_clerk", "evidence_auditor", "senior_counsel"]
-)
-
+workflow.add_conditional_edges("intake", lambda x: x['current_agent'], 
+    {"legal_clerk": "legal_clerk", "evidence_auditor": "evidence_auditor", "senior_counsel": "senior_counsel"})
 workflow.add_edge("legal_clerk", "senior_counsel")
 workflow.add_edge("evidence_auditor", "senior_counsel")
 workflow.add_edge("senior_counsel", END)
