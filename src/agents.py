@@ -2,13 +2,16 @@ import os
 import sys
 import io
 import base64
+import operator
 import streamlit as st
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List, Optional, Annotated, Sequence
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
 from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
+from flashrank import Ranker, RerankRequest
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 import pypdf
 import docx
 
@@ -22,7 +25,6 @@ except ImportError:
 # --- 2. CACHED TOOLS ---
 @st.cache_resource
 def get_ai_tools():
-    # 1. LLM: Gemini 1.5 Flash (Vision Enabled + Safety Disabled)
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash", 
         google_api_key=GOOGLE_API_KEY,
@@ -34,49 +36,52 @@ def get_ai_tools():
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
         }
     )
-    
-    # 2. Database: Qdrant
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False, timeout=60)
-    
-    # 3. Search Models
     encoder = SentenceTransformer(EMBEDDING_MODEL)
-    reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2') 
-    
-    return llm, client, encoder, reranker
+    ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank")
+    return llm, client, encoder, ranker
 
-llm, client, encoder, reranker = get_ai_tools()
+llm, client, encoder, ranker = get_ai_tools()
 
-# --- 3. AGENT STATE ---
+# --- 3. AGENT STATE (PARALLEL ENABLED) ---
 class AgentState(TypedDict):
     messages: List[str]
-    current_agent: str
-    context_data: str
-    file_data: Optional[dict] # Holds the uploaded file bytes
+    # PARALLEL FIX: Use Annotated + operator.add to merge results from multiple agents
+    context_data: Annotated[List[str], operator.add] 
+    file_data: Optional[dict]
 
 # --- 4. AGENTS ---
 
-def intake_router(state: AgentState):
-    """Routes based on File Upload OR Keywords."""
-    # PRIORITY: If a file is uploaded, go straight to the Auditor
-    if state.get("file_data"):
-        return {"current_agent": "evidence_auditor"}
+def intake_router(state: AgentState) -> List[str]:
+    """
+    Fan-Out Router: Returns a LIST of agents to run in parallel.
+    """
+    agents_to_run = []
 
-    if not state['messages']:
-        return {"current_agent": "senior_counsel"}
-    
-    last_msg = state['messages'][-1].lower()
-    
-    if any(x in last_msg for x in ["law", "section", "act", "punishment", "ipc", "rights", "crime", "court", "arrest", "police"]):
-        return {"current_agent": "legal_clerk"}
-    else:
-        return {"current_agent": "senior_counsel"}
+    # 1. If User provided text, we need the Legal Clerk
+    # (Checking if the last message is from user and has content)
+    if state['messages']:
+        agents_to_run.append("legal_clerk")
+
+    # 2. If User uploaded a file, we need the Evidence Auditor
+    if state.get("file_data"):
+        agents_to_run.append("evidence_auditor")
+
+    # Fallback: If nothing to do, go straight to Senior Counsel (should rarely happen)
+    if not agents_to_run:
+        return ["senior_counsel"]
+        
+    return agents_to_run
 
 def legal_clerk(state: AgentState):
-    """Agent B: Research Agent (Search + Rerank)."""
-    query = state['messages'][-1]
+    """Agent B: Research Agent (Returns List for Merge)."""
+    if not state['messages']:
+        return {"context_data": []}
+        
+    query = state['messages'][-1].split("User: ")[-1] # Extract actual query if needed
     
     try:
-        # Broad Search (Dense)
+        # 1. Search
         hits = client.query_points(
             collection_name="legal_knowledge",
             query=encoder.encode(query).tolist(),
@@ -86,111 +91,94 @@ def legal_clerk(state: AgentState):
         ).points
         
         if not hits:
-            return {"context_data": "No matches found.", "messages": ["No specific laws found in database."]}
+            return {"context_data": ["Legal Clerk: No specific laws found."]}
 
-        # Rerank Results
-        docs = [hit.payload.get('full_text', hit.payload.get('text', '')) for hit in hits]
-        scores = reranker.predict([[query, doc] for doc in docs])
-        ranked_hits = sorted(zip(scores, hits), key=lambda x: x[0], reverse=True)
+        # 2. Rerank
+        passages = [{"id": h.id, "text": h.payload.get('full_text', '')} for h in hits]
+        results = ranker.rerank(RerankRequest(query=query, passages=passages))
         
-        # Filter Top Results
         final_results = []
-        for score, hit in ranked_hits[:5]:
-            if score > 0.01:
-                text = hit.payload.get('full_text', hit.payload.get('text', ''))
-                final_results.append(f"- [Rel: {score:.2f}] {text}")
+        for res in results[:5]:
+            if res['score'] > 0.4:
+                final_results.append(f"- [Rel: {res['score']:.2f}] {res['text']}")
         
         if not final_results:
-             return {"context_data": "Low relevance.", "messages": ["I searched but found no relevant laws."]}
+             return {"context_data": ["Legal Clerk: Found laws but low relevance."]}
             
-        return {"context_data": "\n".join(final_results), "messages": [f"Found {len(final_results)} relevant legal precedents."]}
+        # RETURN AS LIST (Crucial for operator.add)
+        combined_text = "LEGAL PRECEDENTS FOUND:\n" + "\n".join(final_results)
+        return {"context_data": [combined_text]}
 
     except Exception as e:
-        return {"context_data": f"Error: {e}", "messages": ["Database access error."]}
+        return {"context_data": [f"Legal Clerk Error: {e}"]}
+
+# Retry Logic Wrapper
+@retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(3))
+def robust_llm_invoke(messages):
+    return llm.invoke(messages)
 
 def evidence_auditor(state: AgentState):
-    """
-    Agent C: The Vision & Document Specialist.
-    Handles PNG/JPG (Gemini Vision), PDF (PyPDF), Docx (Python-Docx).
-    """
+    """Agent C: Vision Specialist (Returns List for Merge)."""
     file_data = state.get("file_data")
     if not file_data:
-        return {"context_data": "No file.", "messages": ["No file was uploaded."]}
+        return {"context_data": []}
 
     file_name = file_data["name"]
     file_type = file_data["type"]
     file_bytes = file_data["bytes"]
     
-    extracted_content = ""
-
     try:
-        # --- HANDLER 1: IMAGES (Vision Analysis) ---
         if "image" in file_type or file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-            # Encode for Gemini
             b64_image = base64.b64encode(file_bytes).decode('utf-8')
-            
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": "You are a Forensic Document Examiner. Analyze this image. 1. Transcribe the text. 2. Describe signatures/stamps. 3. Flag any issues."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-                ]
-            )
-            response = llm.invoke([message])
-            extracted_content = f"[IMAGE ANALYSIS]:\n{response.content}"
+            msg = HumanMessage(content=[
+                {"type": "text", "text": "Forensic Analysis: 1. Transcribe text. 2. Flag issues."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+            ])
+            response = robust_llm_invoke([msg])
+            return {"context_data": [f"EVIDENCE ANALYSIS ({file_name}):\n{response.content}"]}
 
-        # --- HANDLER 2: PDF (Text Extraction) ---
-        elif "pdf" in file_type or file_name.lower().endswith('.pdf'):
-            pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+        elif "pdf" in file_type:
+            pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
+            text = "\n".join([p.extract_text() for p in pdf.pages])
+            return {"context_data": [f"FILE TEXT ({file_name}):\n{text[:5000]}"]}
             
-            if len(text.strip()) < 50:
-                 extracted_content = f"[PDF SCAN DETECTED]: The file '{file_name}' seems to be a scan. For best results, convert to JPG and upload again."
-            else:
-                 extracted_content = f"[PDF TEXT]:\n{text}"
-
-        # --- HANDLER 3: DOCX (Text Extraction) ---
-        elif "word" in file_type or file_name.lower().endswith('.docx'):
+        elif "word" in file_type:
             doc = docx.Document(io.BytesIO(file_bytes))
-            text = "\n".join([para.text for para in doc.paragraphs])
-            extracted_content = f"[DOCX TEXT]:\n{text}"
+            text = "\n".join([p.text for p in doc.paragraphs])
+            return {"context_data": [f"FILE TEXT ({file_name}):\n{text[:5000]}"]}
             
-        else:
-            return {"context_data": "Unsupported file.", "messages": ["File type not supported."]}
-
-        return {
-            "context_data": extracted_content[:4000], # Keep context manageable
-            "messages": [f"I have successfully analyzed the file '{file_name}'."]
-        }
+        return {"context_data": ["Evidence Auditor: Unsupported file type."]}
 
     except Exception as e:
-        return {"context_data": f"File Error: {e}", "messages": ["Failed to process the file."]}
+        return {"context_data": [f"Evidence Auditor Error: {e}"]}
 
 def senior_counsel(state: AgentState):
-    """Agent D: Final Advice Generator."""
+    """Agent D: Fan-In Synthesizer."""
     history = state['messages']
-    context = state.get('context_data', 'No context.')
+    # JOIN the list of contexts into one big string for the LLM
+    context_list = state.get('context_data', [])
+    full_evidence = "\n\n".join(context_list) if context_list else "No evidence provided."
     
     prompt = f"""
-    You are 'Justitia', a sharp and direct AI Legal Co-Counsel.
+    You are 'Justitia', a sharp AI Legal Co-Counsel.
     
     USER QUERY: {history}
-    EVIDENCE / FILE ANALYSIS: {context}
+    
+    COMBINED EVIDENCE (From Parallel Agents):
+    {full_evidence}
     
     INSTRUCTIONS:
-    1. **ANSWER THE USER DIRECTLY FIRST.** (e.g., "No, it is illegal because...", "Yes, provided that...").
-    2. Support your answer using the File Analysis or Legal Evidence provided.
-    3. If the user contradicts a document they uploaded (like asking if they can rag juniors after signing an anti-ragging affidavit), call out the contradiction firmly but professionally.
-    4. Cite specific Clauses/Sections found in the evidence.
+    1. Answer directly.
+    2. Synthesize findings from BOTH the Legal Precedents and the Evidence Analysis (if present).
+    3. If the user's document contradicts the law (or itself), point it out.
     """
     try:
-        response = llm.invoke(prompt)
+        response = robust_llm_invoke(prompt)
         return {"messages": [response.content]}
     except Exception as e:
         return {"messages": [f"Error generating advice: {e}"]}
 
-# --- 5. WORKFLOW ---
+# --- 5. PARALLEL WORKFLOW ---
 workflow = StateGraph(AgentState)
 workflow.add_node("intake", intake_router)
 workflow.add_node("legal_clerk", legal_clerk)
@@ -198,8 +186,16 @@ workflow.add_node("evidence_auditor", evidence_auditor)
 workflow.add_node("senior_counsel", senior_counsel)
 
 workflow.set_entry_point("intake")
-workflow.add_conditional_edges("intake", lambda x: x['current_agent'], 
-    {"legal_clerk": "legal_clerk", "evidence_auditor": "evidence_auditor", "senior_counsel": "senior_counsel"})
+
+# THE PARALLEL EDGE
+# The router returns a list ["legal_clerk", "evidence_auditor"]
+# LangGraph runs them both, then moves to "senior_counsel" when BOTH are done.
+workflow.add_conditional_edges(
+    "intake",
+    intake_router,
+    ["legal_clerk", "evidence_auditor", "senior_counsel"]
+)
+
 workflow.add_edge("legal_clerk", "senior_counsel")
 workflow.add_edge("evidence_auditor", "senior_counsel")
 workflow.add_edge("senior_counsel", END)

@@ -12,3 +12,5 @@ fastembed
 datasets
 pypdf
 python-docx
+tenacity
+flashrank
