@@ -10,3 +10,5 @@ python-dotenv
 pillow
 fastembed
 datasets
+pypdf
+python-docx

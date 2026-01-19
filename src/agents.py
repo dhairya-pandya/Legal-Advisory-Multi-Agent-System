@@ -1,27 +1,30 @@
 import os
 import sys
+import io
+import base64
 import streamlit as st
-from typing import TypedDict, List
+from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
+from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer, CrossEncoder
+import pypdf
+import docx
 
 # --- 1. CONFIG SETUP ---
-# Ensure we can import config.py whether running locally or on Cloud
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
     from config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
 except ImportError:
     from src.config import GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL
 
-# --- 2. CACHED TOOLS (AI Brain) ---
+# --- 2. CACHED TOOLS ---
 @st.cache_resource
 def get_ai_tools():
-    # 1. LLM: Gemini 1.5 Flash with Safety Filters DISABLED
-    # This allows the AI to discuss "crime", "murder", "punishment" without getting blocked.
+    # 1. LLM: Gemini 1.5 Flash (Vision Enabled + Safety Disabled)
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash", 
+        model="gemini-1.5-flash", 
         google_api_key=GOOGLE_API_KEY,
         temperature=0.3,
         safety_settings={
@@ -32,168 +35,173 @@ def get_ai_tools():
         }
     )
     
-    # 2. Database: Qdrant Client (High Timeout prevents network errors)
-    client = QdrantClient(
-        url=QDRANT_URL, 
-        api_key=QDRANT_API_KEY, 
-        prefer_grpc=False,
-        timeout=60
-    )
+    # 2. Database: Qdrant
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False, timeout=60)
     
-    # 3. Retriever: Fast Embedding Model (Finds ~15 potential matches)
+    # 3. Search Models
     encoder = SentenceTransformer(EMBEDDING_MODEL)
-    
-    # 4. Reranker: Precision Model (Filters down to top 3-5 actual matches)
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2') 
     
     return llm, client, encoder, reranker
 
-# Initialize the tools once
 llm, client, encoder, reranker = get_ai_tools()
 
-# --- 3. AGENT STATE DEFINITION ---
+# --- 3. AGENT STATE ---
 class AgentState(TypedDict):
     messages: List[str]
     current_agent: str
     context_data: str
+    file_data: Optional[dict] # Holds the uploaded file bytes
 
-# --- 4. AGENT FUNCTIONS ---
+# --- 4. AGENTS ---
 
 def intake_router(state: AgentState):
-    """
-    Agent A: The Receptionist.
-    Decides if the user needs a Lawyer (Legal Clerk) or an Auditor (Evidence).
-    """
+    """Routes based on File Upload OR Keywords."""
+    # PRIORITY: If a file is uploaded, go straight to the Auditor
+    if state.get("file_data"):
+        return {"current_agent": "evidence_auditor"}
+
     if not state['messages']:
         return {"current_agent": "senior_counsel"}
+    
     last_msg = state['messages'][-1].lower()
     
-    # Keywords to route to Evidence Auditor
-    if any(x in last_msg for x in ["photo", "image", "scan", "contract", "upload", "document"]):
-        return {"current_agent": "evidence_auditor"}
-    # Keywords to route to Legal Clerk
-    elif any(x in last_msg for x in ["law", "section", "act", "punishment", "ipc", "rights", "crime", "police", "court", "arrest"]):
+    if any(x in last_msg for x in ["law", "section", "act", "punishment", "ipc", "rights", "crime", "court", "arrest", "police"]):
         return {"current_agent": "legal_clerk"}
     else:
-        # Default to Senior Counsel for general advice
         return {"current_agent": "senior_counsel"}
 
 def legal_clerk(state: AgentState):
-    """
-    Agent B: The Researcher.
-    Uses Hybrid Search + Reranking to find specific laws.
-    """
+    """Agent B: Research Agent (Search + Rerank)."""
     query = state['messages'][-1]
     
     try:
-        # Step 1: Broad Retrieval (Get top 15 candidates)
-        query_vector = encoder.encode(query).tolist()
-        
+        # Broad Search (Dense)
         hits = client.query_points(
             collection_name="legal_knowledge",
-            query=query_vector,
-            using="dense", # Search using the semantic vector
+            query=encoder.encode(query).tolist(),
+            using="dense",
             limit=15, 
             with_payload=True
         ).points
         
         if not hits:
-            return {"context_data": "No matches found.", "messages": ["I searched the legal database but found no relevant laws."]}
+            return {"context_data": "No matches found.", "messages": ["No specific laws found in database."]}
 
-        # Step 2: Reranking (Precision Filtering)
-        # Extract text from hits
+        # Rerank Results
         docs = [hit.payload.get('full_text', hit.payload.get('text', '')) for hit in hits]
-        
-        # Create pairs [("Query", "Law 1"), ("Query", "Law 2")...]
-        pairs = [[query, doc] for doc in docs]
-        
-        # Get relevance scores
-        scores = reranker.predict(pairs)
-        
-        # Sort results by score (Highest first)
+        scores = reranker.predict([[query, doc] for doc in docs])
         ranked_hits = sorted(zip(scores, hits), key=lambda x: x[0], reverse=True)
         
-        # Step 3: Selection (Keep top 5 valid results)
+        # Filter Top Results
         final_results = []
         for score, hit in ranked_hits[:5]:
-            if score > 0.01: # Filter out complete noise
+            if score > 0.01:
                 text = hit.payload.get('full_text', hit.payload.get('text', ''))
-                final_results.append(f"- [Relevance: {score:.2f}] {text}")
+                final_results.append(f"- [Rel: {score:.2f}] {text}")
         
         if not final_results:
-             return {"context_data": "Laws found but low relevance.", "messages": ["I found some laws, but they didn't seem relevant to your specific question."]}
+             return {"context_data": "Low relevance.", "messages": ["I searched but found no relevant laws."]}
             
-        return {
-            "context_data": "\n".join(final_results), 
-            "messages": [f"I have identified {len(final_results)} highly relevant legal precedents for your case."]
-        }
+        return {"context_data": "\n".join(final_results), "messages": [f"Found {len(final_results)} relevant legal precedents."]}
 
     except Exception as e:
-        # Fallback if database fails
-        return {"context_data": f"Database Error: {e}", "messages": ["I am momentarily unable to access the legal archives."]}
+        return {"context_data": f"Error: {e}", "messages": ["Database access error."]}
 
 def evidence_auditor(state: AgentState):
     """
-    Agent C: The Forensic Analyst.
-    (Currently a placeholder for the Vision/Document analysis feature).
+    Agent C: The Vision & Document Specialist.
+    Handles PNG/JPG (Gemini Vision), PDF (PyPDF), Docx (Python-Docx).
     """
-    return {
-        "context_data": "Document Scan: Valid Rent Agreement. Missing witness signature on Page 2.", 
-        "messages": ["I have analyzed the document. It appears to be a valid Rent Agreement, but I noticed it is missing a witness signature."]
-    }
+    file_data = state.get("file_data")
+    if not file_data:
+        return {"context_data": "No file.", "messages": ["No file was uploaded."]}
+
+    file_name = file_data["name"]
+    file_type = file_data["type"]
+    file_bytes = file_data["bytes"]
+    
+    extracted_content = ""
+
+    try:
+        # --- HANDLER 1: IMAGES (Vision Analysis) ---
+        if "image" in file_type or file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+            # Encode for Gemini
+            b64_image = base64.b64encode(file_bytes).decode('utf-8')
+            
+            message = HumanMessage(
+                content=[
+                    {"type": "text", "text": "You are a Forensic Document Examiner. Analyze this image. 1. Transcribe the text. 2. Describe signatures/stamps. 3. Flag any issues."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                ]
+            )
+            response = llm.invoke([message])
+            extracted_content = f"[IMAGE ANALYSIS]:\n{response.content}"
+
+        # --- HANDLER 2: PDF (Text Extraction) ---
+        elif "pdf" in file_type or file_name.lower().endswith('.pdf'):
+            pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            
+            if len(text.strip()) < 50:
+                 extracted_content = f"[PDF SCAN DETECTED]: The file '{file_name}' seems to be a scan. For best results, convert to JPG and upload again."
+            else:
+                 extracted_content = f"[PDF TEXT]:\n{text}"
+
+        # --- HANDLER 3: DOCX (Text Extraction) ---
+        elif "word" in file_type or file_name.lower().endswith('.docx'):
+            doc = docx.Document(io.BytesIO(file_bytes))
+            text = "\n".join([para.text for para in doc.paragraphs])
+            extracted_content = f"[DOCX TEXT]:\n{text}"
+            
+        else:
+            return {"context_data": "Unsupported file.", "messages": ["File type not supported."]}
+
+        return {
+            "context_data": extracted_content[:4000], # Keep context manageable
+            "messages": [f"I have successfully analyzed the file '{file_name}'."]
+        }
+
+    except Exception as e:
+        return {"context_data": f"File Error: {e}", "messages": ["Failed to process the file."]}
 
 def senior_counsel(state: AgentState):
-    """
-    Agent D: The Senior Lawyer.
-    Synthesizes facts and laws into actionable advice.
-    """
+    """Agent D: Final Advice Generator."""
     history = state['messages']
-    context = state.get('context_data', 'No specific context provided.')
+    context = state.get('context_data', 'No context.')
     
     prompt = f"""
     You are 'Justitia', an AI Legal Co-Counsel for India.
     
-    USER QUERY HISTORY: {history}
-    LEGAL EVIDENCE FROM DATABASE: {context}
+    USER QUERY: {history}
+    EVIDENCE / FILE ANALYSIS: {context}
     
     INSTRUCTIONS:
-    1. Answer the user's question using ONLY the provided Legal Evidence.
-    2. Cite specific Acts, Sections, and punishments mentioned in the evidence.
-    3. If the evidence is missing or irrelevant, provide general legal principles but explicitly warn the user.
-    4. Be professional, empathetic, and concise.
+    1. If a file was analyzed, summarize the findings first.
+    2. Answer the user's query using the Legal Evidence/File Analysis.
+    3. Cite specific Acts/Sections if available.
+    4. Warn if the file quality (scans/images) might affect accuracy.
     """
-    
     try:
         response = llm.invoke(prompt)
         return {"messages": [response.content]}
     except Exception as e:
-        return {"messages": [f"I encountered an error generating your advice. Please try rephrasing your question. (Error: {str(e)})"]}
+        return {"messages": [f"Error generating advice: {e}"]}
 
-# --- 5. WORKFLOW CONSTRUCTION (LangGraph) ---
+# --- 5. WORKFLOW ---
 workflow = StateGraph(AgentState)
-
-# Add Nodes
 workflow.add_node("intake", intake_router)
 workflow.add_node("legal_clerk", legal_clerk)
 workflow.add_node("evidence_auditor", evidence_auditor)
 workflow.add_node("senior_counsel", senior_counsel)
 
-# Add Edges
 workflow.set_entry_point("intake")
-
-workflow.add_conditional_edges(
-    "intake",
-    lambda x: x['current_agent'],
-    {
-        "legal_clerk": "legal_clerk", 
-        "evidence_auditor": "evidence_auditor", 
-        "senior_counsel": "senior_counsel"
-    }
-)
-
+workflow.add_conditional_edges("intake", lambda x: x['current_agent'], 
+    {"legal_clerk": "legal_clerk", "evidence_auditor": "evidence_auditor", "senior_counsel": "senior_counsel"})
 workflow.add_edge("legal_clerk", "senior_counsel")
 workflow.add_edge("evidence_auditor", "senior_counsel")
 workflow.add_edge("senior_counsel", END)
 
-# Compile the graph
 app = workflow.compile()
