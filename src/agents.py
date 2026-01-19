@@ -24,7 +24,7 @@ except ImportError:
 def get_ai_tools():
     # 1. LLM: Gemini 1.5 Flash (Vision Enabled + Safety Disabled)
     llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
+        model="gemini-2.5-flash", 
         google_api_key=GOOGLE_API_KEY,
         temperature=0.3,
         safety_settings={
