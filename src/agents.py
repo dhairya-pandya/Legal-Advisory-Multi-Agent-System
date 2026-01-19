@@ -26,7 +26,7 @@ except ImportError:
 @st.cache_resource
 def get_ai_tools():
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash", 
+        model="gemini-2.5-flash", # <--- FIX: Correct Model Name
         google_api_key=GOOGLE_API_KEY,
         temperature=0.3,
         safety_settings={
@@ -43,56 +43,42 @@ def get_ai_tools():
 
 llm, client, encoder, ranker = get_ai_tools()
 
-# --- 3. AGENT STATE (PARALLEL ENABLED) ---
+# --- 3. AGENT STATE ---
 class AgentState(TypedDict):
     messages: List[str]
-    # PARALLEL FIX: Use Annotated + operator.add to merge results from multiple agents
     context_data: Annotated[List[str], operator.add] 
     file_data: Optional[dict]
 
-# --- 4. NODES & ROUTING ---
+# --- 4. NODES & ROUTING (The Split Fix) ---
 
 def intake(state: AgentState):
-    """
-    FIX: This is now a dummy entry node. 
-    It simply accepts the state and returns an empty update.
-    The actual routing happens in the conditional edge.
-    """
-    return {}
+    """Dummy Entry Node - Must return a Dict"""
+    return {} 
 
 def route_logic(state: AgentState) -> List[str]:
-    """
-    The Router Function (Logic Only).
-    Returns a LIST of node names to run in parallel.
-    """
+    """Router Logic - Returns List of Agent Names"""
     agents_to_run = []
-
-    # 1. If User provided text, we need the Legal Clerk
+    
     if state['messages']:
         agents_to_run.append("legal_clerk")
-
-    # 2. If User uploaded a file, we need the Evidence Auditor
+        
     if state.get("file_data"):
         agents_to_run.append("evidence_auditor")
 
-    # Fallback
     if not agents_to_run:
         return ["senior_counsel"]
         
     return agents_to_run
 
-# --- 5. AGENT FUNCTIONS ---
+# --- 5. AGENTS ---
 
 def legal_clerk(state: AgentState):
-    """Agent B: Research Agent."""
-    # Check if we actually have a query (in case parallel routed here but msg is empty)
     if not state['messages']:
         return {"context_data": []}
         
     query = state['messages'][-1].split("User: ")[-1]
     
     try:
-        # 1. Search
         hits = client.query_points(
             collection_name="legal_knowledge",
             query=encoder.encode(query).tolist(),
@@ -104,10 +90,13 @@ def legal_clerk(state: AgentState):
         if not hits:
             return {"context_data": ["Legal Clerk: No specific laws found."]}
 
-        # 2. Rerank
         passages = [{"id": h.id, "text": h.payload.get('full_text', '')} for h in hits]
         results = ranker.rerank(RerankRequest(query=query, passages=passages))
         
+        # FIX: Safety check if rerank returns None
+        if not results: 
+            return {"context_data": ["Legal Clerk: Reranking found no relevant matches."]}
+
         final_results = []
         for res in results[:5]:
             if res['score'] > 0.4:
@@ -127,7 +116,6 @@ def robust_llm_invoke(messages):
     return llm.invoke(messages)
 
 def evidence_auditor(state: AgentState):
-    """Agent C: Vision Specialist."""
     file_data = state.get("file_data")
     if not file_data:
         return {"context_data": []}
@@ -162,7 +150,6 @@ def evidence_auditor(state: AgentState):
         return {"context_data": [f"Evidence Auditor Error: {e}"]}
 
 def senior_counsel(state: AgentState):
-    """Agent D: Fan-In Synthesizer."""
     history = state['messages']
     context_list = state.get('context_data', [])
     full_evidence = "\n\n".join(context_list) if context_list else "No evidence provided."
@@ -172,13 +159,13 @@ def senior_counsel(state: AgentState):
     
     USER QUERY: {history}
     
-    COMBINED EVIDENCE (From Parallel Agents):
+    COMBINED EVIDENCE:
     {full_evidence}
     
     INSTRUCTIONS:
     1. Answer directly.
-    2. Synthesize findings from BOTH the Legal Precedents and the Evidence Analysis (if present).
-    3. If the user's document contradicts the law (or itself), point it out.
+    2. Synthesize findings from ALL evidence.
+    3. If the user's document contradicts the law, point it out.
     """
     try:
         response = robust_llm_invoke(prompt)
@@ -186,27 +173,21 @@ def senior_counsel(state: AgentState):
     except Exception as e:
         return {"messages": [f"Error generating advice: {e}"]}
 
-# --- 6. WORKFLOW CONSTRUCTION ---
+# --- 6. WORKFLOW ---
 workflow = StateGraph(AgentState)
-
-# Add Nodes
-workflow.add_node("intake", intake) # <--- Dummy Entry Node
+workflow.add_node("intake", intake)
 workflow.add_node("legal_clerk", legal_clerk)
 workflow.add_node("evidence_auditor", evidence_auditor)
 workflow.add_node("senior_counsel", senior_counsel)
 
-# Set Entry
 workflow.set_entry_point("intake")
 
-# PARALLEL EDGES
-# We branch from "intake" (dummy node) using "route_logic" (function)
 workflow.add_conditional_edges(
     "intake",
     route_logic, 
     ["legal_clerk", "evidence_auditor", "senior_counsel"]
 )
 
-# Fan-In: Both parallel nodes go to Senior Counsel
 workflow.add_edge("legal_clerk", "senior_counsel")
 workflow.add_edge("evidence_auditor", "senior_counsel")
 workflow.add_edge("senior_counsel", END)
