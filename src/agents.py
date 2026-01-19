@@ -4,7 +4,7 @@ import io
 import base64
 import operator
 import streamlit as st
-from typing import TypedDict, List, Optional, Annotated, Sequence
+from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
 from langchain_core.messages import HumanMessage
@@ -50,16 +50,24 @@ class AgentState(TypedDict):
     context_data: Annotated[List[str], operator.add] 
     file_data: Optional[dict]
 
-# --- 4. AGENTS ---
+# --- 4. NODES & ROUTING ---
 
-def intake_router(state: AgentState) -> List[str]:
+def intake(state: AgentState):
     """
-    Fan-Out Router: Returns a LIST of agents to run in parallel.
+    FIX: This is now a dummy entry node. 
+    It simply accepts the state and returns an empty update.
+    The actual routing happens in the conditional edge.
+    """
+    return {}
+
+def route_logic(state: AgentState) -> List[str]:
+    """
+    The Router Function (Logic Only).
+    Returns a LIST of node names to run in parallel.
     """
     agents_to_run = []
 
     # 1. If User provided text, we need the Legal Clerk
-    # (Checking if the last message is from user and has content)
     if state['messages']:
         agents_to_run.append("legal_clerk")
 
@@ -67,18 +75,21 @@ def intake_router(state: AgentState) -> List[str]:
     if state.get("file_data"):
         agents_to_run.append("evidence_auditor")
 
-    # Fallback: If nothing to do, go straight to Senior Counsel (should rarely happen)
+    # Fallback
     if not agents_to_run:
         return ["senior_counsel"]
         
     return agents_to_run
 
+# --- 5. AGENT FUNCTIONS ---
+
 def legal_clerk(state: AgentState):
-    """Agent B: Research Agent (Returns List for Merge)."""
+    """Agent B: Research Agent."""
+    # Check if we actually have a query (in case parallel routed here but msg is empty)
     if not state['messages']:
         return {"context_data": []}
         
-    query = state['messages'][-1].split("User: ")[-1] # Extract actual query if needed
+    query = state['messages'][-1].split("User: ")[-1]
     
     try:
         # 1. Search
@@ -105,20 +116,18 @@ def legal_clerk(state: AgentState):
         if not final_results:
              return {"context_data": ["Legal Clerk: Found laws but low relevance."]}
             
-        # RETURN AS LIST (Crucial for operator.add)
         combined_text = "LEGAL PRECEDENTS FOUND:\n" + "\n".join(final_results)
         return {"context_data": [combined_text]}
 
     except Exception as e:
         return {"context_data": [f"Legal Clerk Error: {e}"]}
 
-# Retry Logic Wrapper
 @retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(3))
 def robust_llm_invoke(messages):
     return llm.invoke(messages)
 
 def evidence_auditor(state: AgentState):
-    """Agent C: Vision Specialist (Returns List for Merge)."""
+    """Agent C: Vision Specialist."""
     file_data = state.get("file_data")
     if not file_data:
         return {"context_data": []}
@@ -155,7 +164,6 @@ def evidence_auditor(state: AgentState):
 def senior_counsel(state: AgentState):
     """Agent D: Fan-In Synthesizer."""
     history = state['messages']
-    # JOIN the list of contexts into one big string for the LLM
     context_list = state.get('context_data', [])
     full_evidence = "\n\n".join(context_list) if context_list else "No evidence provided."
     
@@ -178,24 +186,27 @@ def senior_counsel(state: AgentState):
     except Exception as e:
         return {"messages": [f"Error generating advice: {e}"]}
 
-# --- 5. PARALLEL WORKFLOW ---
+# --- 6. WORKFLOW CONSTRUCTION ---
 workflow = StateGraph(AgentState)
-workflow.add_node("intake", intake_router)
+
+# Add Nodes
+workflow.add_node("intake", intake) # <--- Dummy Entry Node
 workflow.add_node("legal_clerk", legal_clerk)
 workflow.add_node("evidence_auditor", evidence_auditor)
 workflow.add_node("senior_counsel", senior_counsel)
 
+# Set Entry
 workflow.set_entry_point("intake")
 
-# THE PARALLEL EDGE
-# The router returns a list ["legal_clerk", "evidence_auditor"]
-# LangGraph runs them both, then moves to "senior_counsel" when BOTH are done.
+# PARALLEL EDGES
+# We branch from "intake" (dummy node) using "route_logic" (function)
 workflow.add_conditional_edges(
     "intake",
-    intake_router,
+    route_logic, 
     ["legal_clerk", "evidence_auditor", "senior_counsel"]
 )
 
+# Fan-In: Both parallel nodes go to Senior Counsel
 workflow.add_edge("legal_clerk", "senior_counsel")
 workflow.add_edge("evidence_auditor", "senior_counsel")
 workflow.add_edge("senior_counsel", END)
