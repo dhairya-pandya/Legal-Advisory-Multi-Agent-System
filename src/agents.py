@@ -103,55 +103,67 @@ def legal_clerk(state: AgentState):
         return {"context_data": f"Database Error: {e}"}
 
 def evidence_auditor(state: AgentState):
-    """The Forensics Expert: Analyzes Video, Audio, Images, Docs."""
+    """
+    Multimodal Agent: Sorts and Analyzes Video, Audio, and Text.
+    """
     file_data = state.get("file_data")
     if not file_data: return {"context_data": "No file."}
     
+    # 1. GET FILE DETAILS
     file_name = file_data["name"].lower()
     file_type = file_data["type"]
     file_bytes = file_data["bytes"]
 
     try:
-        # A. VIDEO ANALYSIS (Native Gemini 2.5)
-        if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov')):
+        # --- SORTING LOGIC ---
+        
+        # CATEGORY 1: VIDEO (Visuals + Audio)
+        if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov', '.mkv')):
             b64_video = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[
-                {"type": "text", "text": "Analyze this video evidence. 1. Chronologically describe the events. 2. Identify any illegal acts (assault, theft, negligence). 3. Transcribe audible dialogue."},
+                {"type": "text", "text": "Analyze this video evidence. 1. Describe the events chronologically. 2. Identify any potential illegal acts (assault, theft, negligence). 3. Transcribe any dialogue."},
                 {"type": "media", "mime_type": "video/mp4", "data": b64_video}
             ])
             res = llm.invoke([msg])
-            return {"context_data": f"VIDEO EVIDENCE ANALYSIS ({file_name}):\n{res.content}"}
+            return {"context_data": f"VIDEO ANALYSIS ({file_name}):\n{res.content}"}
 
-        # B. AUDIO ANALYSIS (Native Gemini 2.5)
-        elif "audio" in file_type or file_name.endswith(('.mp3', '.wav')):
+        # CATEGORY 2: AUDIO (Voice/Sound)
+        elif "audio" in file_type or file_name.endswith(('.mp3', '.wav', '.m4a')):
             b64_audio = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[
-                {"type": "text", "text": "Listen to this audio. 1. Transcribe the conversation. 2. Detect the tone/emotion. 3. Identify potential threats or admissions."},
+                {"type": "text", "text": "Listen to this audio evidence. 1. Transcribe the conversation accurately. 2. Identify the emotional tone (threatening, scared, calm)."},
                 {"type": "media", "mime_type": "audio/mp3", "data": b64_audio}
             ])
             res = llm.invoke([msg])
-            return {"context_data": f"AUDIO EVIDENCE ANALYSIS ({file_name}):\n{res.content}"}
+            return {"context_data": f"AUDIO ANALYSIS ({file_name}):\n{res.content}"}
 
-        # C. IMAGE ANALYSIS
+        # CATEGORY 3: IMAGES (Visuals)
         elif "image" in file_type or file_name.endswith(('.png', '.jpg', '.jpeg')):
             b64_img = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[
-                {"type":"text", "text":"Analyze this image. If it's a document, transcribe it. If it's a photo, describe the scene relevant to a legal case."}, 
+                {"type":"text", "text":"Analyze this image. If it is a document, transcribe the text. If it is a scene, describe it relevant to a legal case."}, 
                 {"type":"image_url", "image_url":{"url":f"data:image/jpeg;base64,{b64_img}"}}
             ])
             res = llm.invoke([msg])
-            return {"context_data": f"IMAGE ANALYSIS:\n{res.content}"}
+            return {"context_data": f"IMAGE ANALYSIS ({file_name}):\n{res.content}"}
         
-        # D. PDF/DOCS HANDLING
+        # CATEGORY 4: DOCUMENTS (PDF/DOCX)
         elif "pdf" in file_type:
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-            return {"context_data": f"FILE TEXT:\n{text[:4000]}"}
+            return {"context_data": f"FILE TEXT ({file_name}):\n{text[:4000]}"}
 
-        return {"context_data": "File content extracted."}
+        elif "word" in file_type or "document" in file_type:
+             doc = docx.Document(io.BytesIO(file_bytes))
+             text = "\n".join([p.text for p in doc.paragraphs])
+             return {"context_data": f"FILE TEXT ({file_name}):\n{text[:4000]}"}
+
+        # FALLBACK: If we can't sort it, we reject it.
+        else:
+            return {"context_data": f"Error: Unsupported file type ({file_type}). Please upload Video, Audio, Image, or PDF."}
         
     except Exception as e:
-        return {"context_data": f"File Analysis Error: {e}"}
+        return {"context_data": f"Analysis Error: {e}"}
 
 def senior_counsel(state: AgentState):
     """The Judge: Synthesizes final advice in English."""
