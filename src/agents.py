@@ -12,7 +12,7 @@ from sentence_transformers import SentenceTransformer
 import pypdf
 import docx
 
-# --- 1. CREDENTIALS ---
+# --- 1. CREDENTIALS & CONFIG ---
 def get_credentials():
     creds = {}
     try:
@@ -37,11 +37,12 @@ if not CREDS["GOOGLE_API_KEY"]:
     st.error("🚨 Configuration Error: API Keys not found.")
     st.stop()
 
-# --- 2. TOOLS ---
+# --- 2. AI TOOLS INITIALIZATION ---
 @st.cache_resource
 def get_ai_tools():
+    # Using Gemini 2.5 Flash for Native Multimodal (Video/Audio) support
     llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
+        model="gemini-2.5-flash", 
         google_api_key=CREDS["GOOGLE_API_KEY"],
         temperature=0.3,
         safety_settings={
@@ -57,7 +58,7 @@ def get_ai_tools():
 
 llm, client, encoder = get_ai_tools()
 
-# --- 3. STATE ---
+# --- 3. AGENT STATE DEFINITION ---
 class AgentState(TypedDict):
     messages: List[str]
     context_data: str 
@@ -67,24 +68,23 @@ class AgentState(TypedDict):
 # --- 4. AGENTS ---
 
 def intake_router(state: AgentState):
+    """Decides which agent to run based on input type."""
     if state.get("file_data"):
         return {"current_agent": "evidence_auditor"}
     if not state['messages']:
         return {"current_agent": "senior_counsel"}
+    # Default to Legal Search for text queries
     return {"current_agent": "legal_clerk"}
 
 def legal_clerk(state: AgentState):
-    """Search Agent (English Optimized)."""
+    """The Researcher: Searches Qdrant for Laws."""
     if not state.get('messages'): return {"context_data": "No query."}
-    
-    # We still keep the internal translation for SEARCH accuracy
     raw_query = state['messages'][-1].split("User: ")[-1]
     
     try:
-        # Translate query to English for better Vector Search
-        trans_prompt = f"Translate to English for legal search: '{raw_query}'"
-        english_query_resp = llm.invoke(trans_prompt)
-        search_query = english_query_resp.content.strip()
+        # Internal thought: Translate to English for better search precision
+        trans_prompt = f"Translate to English for legal search keywords: '{raw_query}'"
+        search_query = llm.invoke(trans_prompt).content.strip()
         
         hits = client.query_points(
             collection_name="legal_knowledge",
@@ -97,46 +97,75 @@ def legal_clerk(state: AgentState):
         if not hits: return {"context_data": f"No specific laws found for: {search_query}"}
         
         results = [f"- {h.payload.get('full_text', h.payload.get('text', 'Law'))}" for h in hits]
-        return {"context_data": "LEGAL PRECEDENTS (English):\n" + "\n".join(results)}
+        return {"context_data": "LEGAL PRECEDENTS (Database):\n" + "\n".join(results)}
 
     except Exception as e:
         return {"context_data": f"Database Error: {e}"}
 
 def evidence_auditor(state: AgentState):
-    """Multimodal Analysis"""
+    """The Forensics Expert: Analyzes Video, Audio, Images, Docs."""
     file_data = state.get("file_data")
     if not file_data: return {"context_data": "No file."}
     
+    file_name = file_data["name"].lower()
+    file_type = file_data["type"]
+    file_bytes = file_data["bytes"]
+
     try:
-        if "image" in file_data["type"] or file_data["name"].lower().endswith(('.png', '.jpg', '.jpeg')):
-            b64 = base64.b64encode(file_data["bytes"]).decode('utf-8')
+        # A. VIDEO ANALYSIS (Native Gemini 2.5)
+        if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov')):
+            b64_video = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[
-                {"type":"text", "text":"Analyze this legal document. Transcribe text and flag key clauses."}, 
-                {"type":"image_url", "image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
+                {"type": "text", "text": "Analyze this video evidence. 1. Chronologically describe the events. 2. Identify any illegal acts (assault, theft, negligence). 3. Transcribe audible dialogue."},
+                {"type": "media", "mime_type": "video/mp4", "data": b64_video}
             ])
             res = llm.invoke([msg])
-            return {"context_data": f"EVIDENCE ANALYSIS:\n{res.content}"}
+            return {"context_data": f"VIDEO EVIDENCE ANALYSIS ({file_name}):\n{res.content}"}
+
+        # B. AUDIO ANALYSIS (Native Gemini 2.5)
+        elif "audio" in file_type or file_name.endswith(('.mp3', '.wav')):
+            b64_audio = base64.b64encode(file_bytes).decode('utf-8')
+            msg = HumanMessage(content=[
+                {"type": "text", "text": "Listen to this audio. 1. Transcribe the conversation. 2. Detect the tone/emotion. 3. Identify potential threats or admissions."},
+                {"type": "media", "mime_type": "audio/mp3", "data": b64_audio}
+            ])
+            res = llm.invoke([msg])
+            return {"context_data": f"AUDIO EVIDENCE ANALYSIS ({file_name}):\n{res.content}"}
+
+        # C. IMAGE ANALYSIS
+        elif "image" in file_type or file_name.endswith(('.png', '.jpg', '.jpeg')):
+            b64_img = base64.b64encode(file_bytes).decode('utf-8')
+            msg = HumanMessage(content=[
+                {"type":"text", "text":"Analyze this image. If it's a document, transcribe it. If it's a photo, describe the scene relevant to a legal case."}, 
+                {"type":"image_url", "image_url":{"url":f"data:image/jpeg;base64,{b64_img}"}}
+            ])
+            res = llm.invoke([msg])
+            return {"context_data": f"IMAGE ANALYSIS:\n{res.content}"}
         
-        elif "pdf" in file_data["type"]:
-            pdf = pypdf.PdfReader(io.BytesIO(file_data["bytes"]))
+        # D. PDF/DOCS HANDLING
+        elif "pdf" in file_type:
+            pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
             return {"context_data": f"FILE TEXT:\n{text[:4000]}"}
 
         return {"context_data": "File content extracted."}
         
     except Exception as e:
-        return {"context_data": f"File Error: {e}"}
+        return {"context_data": f"File Analysis Error: {e}"}
 
 def senior_counsel(state: AgentState):
-    """Final Advice - Output in English/Source Language (No forced translation)."""
+    """The Judge: Synthesizes final advice in English."""
     history = state.get('messages', [])
     context = state.get('context_data', "No evidence.")
     
     prompt = f"""
     You are 'Justitia', an AI Legal Co-Counsel.
     USER CONVERSATION: {history}
-    EVIDENCE: {context}
-    INSTRUCTIONS: Answer legally and cited. Use English unless the user explicitly asked in another language.
+    EVIDENCE / ANALYSIS: {context}
+    INSTRUCTIONS: 
+    1. Answer the legal query directly.
+    2. Cite specific IPC/BNS sections from the evidence or database.
+    3. Output in English (Translation is handled separately).
     """
     try:
         res = llm.invoke(prompt)
@@ -144,7 +173,7 @@ def senior_counsel(state: AgentState):
     except Exception as e:
         return {"messages": [f"Error: {e}"]}
 
-# --- 5. WORKFLOW ---
+# --- 5. WORKFLOW GRAPH ---
 workflow = StateGraph(AgentState)
 workflow.add_node("intake", intake_router)
 workflow.add_node("legal_clerk", legal_clerk)
