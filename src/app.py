@@ -1,118 +1,113 @@
 import streamlit as st
 import base64
 from langchain_core.messages import HumanMessage
-from agents import app as agent_app, llm  # Import llm for transcription
+from agents import app as agent_app, llm
 
 st.set_page_config(page_title="Justitia AI", page_icon="⚖️")
-
 st.title("⚖️ Justitia: AI Legal Co-Counsel")
-st.markdown("### Democratizing Access to Justice in India")
 
-if "messages" not in st.session_state:
-    st.session_state["messages"] = []
+# --- SESSION STATE ---
+if "messages" not in st.session_state: st.session_state["messages"] = []
+if "last_original_response" not in st.session_state: st.session_state["last_original_response"] = None
 
-# --- SIDEBAR CONFIG ---
-st.sidebar.header("⚙️ Settings")
-language = st.sidebar.selectbox(
-    "🗣️ Output Language",
-    ["English", "Hindi", "Marathi", "Tamil", "Telugu", "Kannada", "Bengali", "Gujarati"]
-)
+# --- SIDEBAR (Voice & Tools) ---
+with st.sidebar:
+    st.header("🎙️ Voice Counsel")
+    # Placing audio input here keeps the main chat clean
+    audio_input = st.audio_input("Tap to Speak", key="voice_rec")
+    
+    st.divider()
+    st.header("📂 Evidence Locker")
+    uploaded_file = st.file_uploader("Upload Documents", type=["png", "jpg", "pdf", "docx"])
+    
+    st.divider()
+    st.info("Agent Activity Log")
 
-st.sidebar.info("This panel visualizes the Multi-Agent decision path.")
-uploaded_file = st.sidebar.file_uploader(
-    "📂 Upload Evidence", 
-    type=["png", "jpg", "jpeg", "pdf", "docx"]
-)
+# --- MAIN CHAT HISTORY ---
+# We create a container for history so it doesn't overlap with the bottom input
+chat_container = st.container()
+with chat_container:
+    for msg in st.session_state["messages"]:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
 
-# --- DISPLAY CHAT ---
-for msg in st.session_state["messages"]:
-    role = "user" if msg["role"] == "user" else "assistant"
-    with st.chat_message(role):
-        st.write(msg["content"])
-
-# --- INPUT HANDLERS ---
-# 1. Voice Input
-audio_value = st.audio_input("🎤 Record Voice Command")
-
-# 2. Text Input
-text_input = st.chat_input("Type your legal question...")
-
+# --- INPUT HANDLING ---
 final_input = None
 
-# LOGIC: Handle Voice OR Text
-if audio_value:
-    # Transcribe Audio using Gemini (Multimodal)
+# 1. Handle Voice Input (Priority)
+if audio_input:
     with st.spinner("🎧 Transcribing voice..."):
         try:
-            audio_bytes = audio_value.getvalue()
-            # We treat audio as a "file" for Gemini to transcribe
-            # Note: We need to pass audio bytes correctly. 
-            # Since Gemini 1.5 Flash is multimodal, we can send audio blob directly.
-            b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-            
+            b64_audio = base64.b64encode(audio_input.getvalue()).decode("utf-8")
             msg = HumanMessage(content=[
-                {"type": "text", "text": "Transcribe this audio exactly. Do not add any other text."},
+                {"type": "text", "text": "Transcribe this audio exactly. Output ONLY the text."}, 
                 {"type": "media", "mime_type": "audio/wav", "data": b64_audio}
             ])
-            # For simplicity in this hackathon, let's assume it's English/Hindi mixed
-            # Ideally, we use the 'llm' imported from agents
             res = llm.invoke([msg])
-            transcribed_text = res.content
-            
-            st.success(f"🗣️ You said: {transcribed_text}")
-            final_input = transcribed_text
+            final_input = res.content
         except Exception as e:
-            st.error(f"Audio Error: {e}")
+            st.error(f"Transcription Error: {e}")
 
-elif text_input:
+# 2. Handle Text Input
+# This stays fixed at the bottom
+text_input = st.chat_input("Type your legal question here...")
+if text_input:
     final_input = text_input
 
-# --- PROCESS INPUT ---
+# --- PROCESS INPUT (Agent Logic) ---
 if final_input:
-    # Append User Message
     st.session_state["messages"].append({"role": "user", "content": final_input})
     with st.chat_message("user"):
         st.write(final_input)
 
-    # Convert History to Strings
-    chat_history = [f"{m['role']}: {m['content']}" for m in st.session_state["messages"]]
-    
     # Prepare Inputs
-    # We pass the 'language' preference to the agent state so Senior Counsel knows!
-    inputs = {
-        "messages": chat_history,
-        "context_data": f"User Preferred Language: {language}" 
-    }
+    chat_history = [f"{m['role']}: {m['content']}" for m in st.session_state["messages"]]
+    inputs = {"messages": chat_history}
     
-    # Handle File
     if uploaded_file:
         inputs["file_data"] = {
-            "name": uploaded_file.name,
-            "type": uploaded_file.type,
+            "name": uploaded_file.name, 
+            "type": uploaded_file.type, 
             "bytes": uploaded_file.getvalue()
         }
         st.sidebar.success(f"📎 Attached: {uploaded_file.name}")
 
-    # Run Agents
-    with st.spinner(f"Justitia is analyzing in {language}..."):
-        final_response = ""
+    # Run Agent
+    with st.spinner("Justitia is thinking..."):
+        final_res = ""
         try:
             for output in agent_app.stream(inputs):
-                for agent_name, agent_state in output.items():
-                    with st.sidebar.expander(f"🔹 Active: {agent_name}", expanded=True):
+                for name, state in output.items():
+                    # Traceability in Sidebar
+                    with st.sidebar.expander(f"🔹 Active: {name}", expanded=True):
                         st.write("Processing...")
-                        # Show context if updated (handling the String format)
-                        if "context_data" in agent_state:
-                             # Just show a snippet
-                             st.caption(str(agent_state["context_data"])[:100] + "...")
-
-                    if "messages" in agent_state:
-                        final_response = agent_state["messages"][-1]
-        
+                        if "context_data" in state: 
+                            st.caption(str(state["context_data"])[:100]+"...")
+                    
+                    if "messages" in state: 
+                        final_res = state["messages"][-1]
+            
+            st.session_state["last_original_response"] = final_res
+            st.session_state["messages"].append({"role": "assistant", "content": final_res})
+            st.rerun()
+            
         except Exception as e:
-            final_response = f"⚠️ System Error: {str(e)}"
+            st.error(f"Error: {e}")
 
-    # Display Output
-    st.session_state["messages"].append({"role": "assistant", "content": final_response})
-    with st.chat_message("assistant"):
-        st.write(final_response)
+# --- POST-PROCESSING (Translation) ---
+if st.session_state["last_original_response"]:
+    # This container sits just above the chat input
+    with st.container():
+        st.markdown("---")
+        c1, c2 = st.columns([1, 4])
+        with c1:
+            if st.button("🌐 Translate"):
+                st.session_state["show_translate"] = not st.session_state.get("show_translate", False)
+        
+        if st.session_state.get("show_translate"):
+            lang = st.selectbox("Select Language", ["Hindi", "Tamil", "Marathi", "Telugu"], key="lang_opt")
+            if lang:
+                with st.spinner(f"Translating to {lang}..."):
+                    prompt = f"Translate to {lang}: {st.session_state['last_original_response']}"
+                    trans = llm.invoke(prompt).content
+                    st.info(f"**Translation ({lang}):**\n\n{trans}")

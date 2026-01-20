@@ -67,33 +67,25 @@ class AgentState(TypedDict):
 # --- 4. AGENTS ---
 
 def intake_router(state: AgentState):
-    """Routing Logic"""
     if state.get("file_data"):
         return {"current_agent": "evidence_auditor"}
     if not state['messages']:
         return {"current_agent": "senior_counsel"}
-    
-    # We always go to legal clerk for text queries to ensure good search
     return {"current_agent": "legal_clerk"}
 
 def legal_clerk(state: AgentState):
-    """
-    Search Agent with MULTILINGUAL Translation.
-    """
+    """Search Agent (English Optimized)."""
     if not state.get('messages'): return {"context_data": "No query."}
     
-    # Get the raw user query
-    # Format might be "User: <hindi text>"
+    # We still keep the internal translation for SEARCH accuracy
     raw_query = state['messages'][-1].split("User: ")[-1]
     
     try:
-        # STEP 1: TRANSLATE TO ENGLISH (Internal Thought)
-        # We ask Gemini to normalize the query for Qdrant Search
-        trans_prompt = f"Translate this legal query to English keywords for vector search. If it is already English, just output it. Query: '{raw_query}'"
+        # Translate query to English for better Vector Search
+        trans_prompt = f"Translate to English for legal search: '{raw_query}'"
         english_query_resp = llm.invoke(trans_prompt)
         search_query = english_query_resp.content.strip()
         
-        # STEP 2: SEARCH QDRANT (Using English Query)
         hits = client.query_points(
             collection_name="legal_knowledge",
             query=encoder.encode(search_query).tolist(),
@@ -104,12 +96,8 @@ def legal_clerk(state: AgentState):
         
         if not hits: return {"context_data": f"No specific laws found for: {search_query}"}
         
-        # Format Results
         results = [f"- {h.payload.get('full_text', h.payload.get('text', 'Law'))}" for h in hits]
-        
-        # We append the original query language preference context if it exists
-        existing_context = state.get('context_data', '')
-        return {"context_data": existing_context + "\n\nLEGAL PRECEDENTS (English Search):\n" + "\n".join(results)}
+        return {"context_data": "LEGAL PRECEDENTS (English):\n" + "\n".join(results)}
 
     except Exception as e:
         return {"context_data": f"Database Error: {e}"}
@@ -120,7 +108,6 @@ def evidence_auditor(state: AgentState):
     if not file_data: return {"context_data": "No file."}
     
     try:
-        # Handle Images
         if "image" in file_data["type"] or file_data["name"].lower().endswith(('.png', '.jpg', '.jpeg')):
             b64 = base64.b64encode(file_data["bytes"]).decode('utf-8')
             msg = HumanMessage(content=[
@@ -130,33 +117,26 @@ def evidence_auditor(state: AgentState):
             res = llm.invoke([msg])
             return {"context_data": f"EVIDENCE ANALYSIS:\n{res.content}"}
         
-        # Handle PDF/Docs (Text Extraction)
-        # ... (Same as before) ...
+        elif "pdf" in file_data["type"]:
+            pdf = pypdf.PdfReader(io.BytesIO(file_data["bytes"]))
+            text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
+            return {"context_data": f"FILE TEXT:\n{text[:4000]}"}
+
         return {"context_data": "File content extracted."}
         
     except Exception as e:
         return {"context_data": f"File Error: {e}"}
 
 def senior_counsel(state: AgentState):
-    """
-    Final Advice - Speaks User's Language.
-    """
+    """Final Advice - Output in English/Source Language (No forced translation)."""
     history = state.get('messages', [])
     context = state.get('context_data', "No evidence.")
     
     prompt = f"""
-    You are 'Justitia', an AI Legal Co-Counsel for India.
-    
+    You are 'Justitia', an AI Legal Co-Counsel.
     USER CONVERSATION: {history}
-    
-    EVIDENCE & RESEARCH:
-    {context}
-    
-    INSTRUCTIONS:
-    1. Analyze the Evidence and User Query.
-    2. Provide a clear, legal answer citing the sections found in the evidence.
-    3. **IMPORTANT:** Check the 'User Preferred Language' in the evidence or infer it from the user's last message. 
-    4. **OUTPUT THE FINAL ANSWER IN THAT TARGET LANGUAGE.** (e.g., if user asks in Hindi, answer in Hindi).
+    EVIDENCE: {context}
+    INSTRUCTIONS: Answer legally and cited. Use English unless the user explicitly asked in another language.
     """
     try:
         res = llm.invoke(prompt)
