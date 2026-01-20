@@ -21,14 +21,13 @@ from sentence_transformers import SentenceTransformer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("JustitiaBackend")
 
-# Define Agent Names as Enums to prevent typos
 class AgentNodes(str, Enum):
     INTAKE = "intake_router"
     LEGAL_CLERK = "legal_clerk"
     EVIDENCE_AUDITOR = "evidence_auditor"
     SENIOR_COUNSEL = "senior_counsel"
 
-# Centralized Prompts for easy tuning
+# Centralized Prompts
 PROMPTS = {
     "translation": "Translate to English for legal search keywords: '{query}'",
     "video_analysis": "Analyze this video evidence. 1. Chronologically describe the events. 2. Identify any potential illegal acts (assault, theft, negligence). 3. Transcribe any audible dialogue.",
@@ -47,7 +46,6 @@ PROMPTS = {
 
 # --- 2. CREDENTIALS MANAGEMENT ---
 def get_credentials() -> Dict[str, str]:
-    """Retrieves API keys from Config, Secrets, or Environment."""
     creds = {}
     try:
         import config
@@ -65,14 +63,13 @@ def get_credentials() -> Dict[str, str]:
 CREDS = get_credentials()
 
 if not CREDS["GOOGLE_API_KEY"]:
-    st.error("🚨 Critical Error: GOOGLE_API_KEY is missing. Please check config.py or Streamlit Secrets.")
+    st.error("🚨 Critical Error: GOOGLE_API_KEY is missing.")
     st.stop()
 
-# --- 3. AI TOOLS INITIALIZATION (SINGLETON) ---
+# --- 3. AI TOOLS INITIALIZATION ---
 @st.cache_resource
 def get_ai_tools():
-    """Initializes and caches heavy AI models."""
-    # 1. LLM: Gemini 2.5 Flash (Native Multimodal)
+    # 1. LLM: Gemini 2.5 Flash
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash", 
         google_api_key=CREDS["GOOGLE_API_KEY"],
@@ -80,15 +77,12 @@ def get_ai_tools():
         safety_settings={
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
         }
     )
     
     # 2. Database: Qdrant
     client = QdrantClient(url=CREDS["QDRANT_URL"], api_key=CREDS["QDRANT_API_KEY"], prefer_grpc=False, timeout=60)
     
-    # Ensure 'response_cache' collection exists for optimization
     try:
         client.get_collection("response_cache")
     except Exception:
@@ -105,13 +99,10 @@ def get_ai_tools():
 
 llm, client, encoder = get_ai_tools()
 
-# --- 4. OPTIMIZATION HELPERS ---
+# --- 4. OPTIMIZATION & PRIVACY HELPERS ---
 
 def robust_language_check(text: str) -> bool:
-    """
-    Check if text is Non-English using local CPU (saves API calls).
-    Returns True if translation is needed.
-    """
+    """Check if text is Non-English using local CPU."""
     try:
         lang = detect(text)
         return lang != 'en' 
@@ -127,7 +118,6 @@ def check_semantic_cache(query: str) -> Optional[str]:
             query_vector=vector,
             limit=1
         )
-        # Threshold 0.92 ensures high semantic similarity
         if hits and hits[0].score > 0.92:
             logger.info("CACHE HIT! Returning stored answer.")
             return hits[0].payload["answer"]
@@ -135,11 +125,17 @@ def check_semantic_cache(query: str) -> Optional[str]:
         logger.warning(f"Cache Check Failed: {e}")
     return None
 
-def store_in_cache(query: str, answer: str):
-    """Stores the Query-Answer pair in Qdrant for future use."""
+def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
+    """
+    Stores the Query-Answer pair in Qdrant.
+    PRIVACY GUARD: If sensitive_mode is True, returns immediately.
+    """
+    if sensitive_mode:
+        logger.info("PRIVACY MODE: Skipping cache write.")
+        return
+
     try:
         vector = encoder.encode(query).tolist()
-        # Use hash of query as ID to prevent duplicates
         point_id = abs(hash(query)) % (10**18) 
         client.upsert(
             collection_name="response_cache",
@@ -160,11 +156,11 @@ class AgentState(TypedDict):
     context_data: str 
     file_data: Optional[Dict[str, Any]]
     current_agent: str
+    is_incognito: bool
 
 # --- 6. AGENT FUNCTIONS ---
 
 def intake_router(state: AgentState) -> Dict[str, str]:
-    """Routes execution based on input type."""
     if state.get("file_data"):
         return {"current_agent": AgentNodes.EVIDENCE_AUDITOR}
     if not state.get('messages'):
@@ -172,20 +168,17 @@ def intake_router(state: AgentState) -> Dict[str, str]:
     return {"current_agent": AgentNodes.LEGAL_CLERK}
 
 def legal_clerk(state: AgentState) -> Dict[str, str]:
-    """Retrieves legal context from Qdrant."""
     if not state.get('messages'): return {"context_data": "No query provided."}
     
     raw_query = state['messages'][-1].split("User: ")[-1]
     search_query = raw_query
     
     try:
-        # Optimization: Only translate if language is NOT English
         if robust_language_check(raw_query):
             trans_prompt = PROMPTS["translation"].format(query=raw_query)
             trans_res = llm.invoke(trans_prompt)
             search_query = trans_res.content.strip()
         
-        # Vector Search
         hits = client.query_points(
             collection_name="legal_knowledge",
             query=encoder.encode(search_query).tolist(),
@@ -204,7 +197,6 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
         return {"context_data": f"Database Error: {e}"}
 
 def evidence_auditor(state: AgentState) -> Dict[str, str]:
-    """Multimodal Analysis: Handles Video, Audio, Images, and Docs."""
     file_data = state.get("file_data")
     if not file_data: return {"context_data": "No file uploaded."}
     
@@ -213,7 +205,7 @@ def evidence_auditor(state: AgentState) -> Dict[str, str]:
     file_bytes = file_data["bytes"]
 
     try:
-        # --- 1. VIDEO HANDLING ---
+        # Video
         if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov', '.mkv')):
             b64_video = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[
@@ -223,7 +215,7 @@ def evidence_auditor(state: AgentState) -> Dict[str, str]:
             res = llm.invoke([msg])
             return {"context_data": f"VIDEO ANALYSIS ({file_name}):\n{res.content}"}
 
-        # --- 2. AUDIO HANDLING ---
+        # Audio
         elif "audio" in file_type or file_name.endswith(('.mp3', '.wav', '.m4a')):
             b64_audio = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[
@@ -233,7 +225,7 @@ def evidence_auditor(state: AgentState) -> Dict[str, str]:
             res = llm.invoke([msg])
             return {"context_data": f"AUDIO ANALYSIS ({file_name}):\n{res.content}"}
 
-        # --- 3. IMAGE HANDLING ---
+        # Image
         elif "image" in file_type or file_name.endswith(('.png', '.jpg', '.jpeg')):
             b64_img = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[
@@ -243,7 +235,7 @@ def evidence_auditor(state: AgentState) -> Dict[str, str]:
             res = llm.invoke([msg])
             return {"context_data": f"IMAGE ANALYSIS ({file_name}):\n{res.content}"}
         
-        # --- 4. DOCUMENT HANDLING ---
+        # Docs
         elif "pdf" in file_type:
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
@@ -266,11 +258,14 @@ def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
     context = state.get('context_data', "No evidence.")
     
+    # Retrieve Privacy Flag
+    is_incognito = state.get("is_incognito", False)
+
     user_query = history[-1] if history else ""
     
     # --- CACHE READ ---
-    # Only check cache if no file (evidence makes queries unique)
-    if not state.get("file_data"):
+    # Read if: No file uploaded AND Incognito is OFF
+    if not state.get("file_data") and not is_incognito:
         cached_ans = check_semantic_cache(user_query)
         if cached_ans:
             return {"messages": [f"**(Cached)** {cached_ans}"]}
@@ -283,8 +278,10 @@ def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
         answer = res.content
         
         # --- CACHE WRITE ---
+        # Write if: No file uploaded AND Incognito is OFF
+        # We pass the flag to store_in_cache as a double-check
         if not state.get("file_data"):
-            store_in_cache(user_query, answer)
+            store_in_cache(user_query, answer, sensitive_mode=is_incognito)
             
         return {"messages": [answer]}
     except Exception as e:

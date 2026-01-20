@@ -27,7 +27,7 @@ init_state()
 # --- 3. UI FUNCTIONS ---
 
 def render_sidebar():
-    """Renders Sidebar Inputs."""
+    """Renders Sidebar Inputs and returns selected values."""
     with st.sidebar:
         st.header("🎙️ Voice Counsel")
         audio_in = st.audio_input("Tap to Speak", key="voice_rec")
@@ -44,8 +44,16 @@ def render_sidebar():
             elif "image" in ft: st.image(uploaded_file)
             
         st.divider()
+        
+        # --- PRIVACY CONTROLS ---
+        st.header("🔒 Privacy")
+        incognito = st.toggle("Incognito Mode", value=False, help="When active, your queries and evidence will NOT be saved to the learning cache.")
+        if incognito:
+            st.caption("✅ Data Retention: Disabled")
+        
+        st.divider()
         st.info("Agent Activity Log")
-        return audio_in, uploaded_file
+        return audio_in, uploaded_file, incognito
 
 def process_voice_input(audio_input):
     """Transcribes voice to text."""
@@ -101,7 +109,9 @@ def main():
     with c1: st.image("https://cdn-icons-png.flaticon.com/512/924/924915.png", width=60)
     with c2: st.title("Justitia: AI Legal Co-Counsel")
     
-    audio_val, file_val = render_sidebar()
+    # Capture Inputs (including Incognito flag)
+    audio_val, file_val, is_incognito = render_sidebar()
+    
     render_chat()
     render_translation_tools()
 
@@ -127,7 +137,12 @@ def main():
 
         # 2. Prepare Inputs for Backend
         chat_history = [f"{m['role']}: {m['content']}" for m in st.session_state["messages"]]
-        inputs = {"messages": chat_history}
+        
+        # Inject the privacy flag into the state
+        inputs = {
+            "messages": chat_history,
+            "is_incognito": is_incognito  # <--- Passed to Agent Logic
+        }
         
         if file_val:
             inputs["file_data"] = {
