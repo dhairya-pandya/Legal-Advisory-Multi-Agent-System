@@ -17,14 +17,13 @@ from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 
-# --- EMERGENCY FIX: DISABLE LIVE SEARCH TO PREVENT CRASH ---
-# We comment this out to stop the ImportError
-# try:
-#     from langchain_community.tools import DuckDuckGoSearchRun
-#     SEARCH_AVAILABLE = True
-# except ImportError:
-SEARCH_AVAILABLE = False
-logging.warning("⚠️ Live Search disabled to prevent cloud crash.")
+# --- EMERGENCY FIX: BYPASS SEARCH IF MISSING ---
+try:
+    from langchain_community.tools import DuckDuckGoSearchRun
+    SEARCH_AVAILABLE = True
+except ImportError:
+    SEARCH_AVAILABLE = False
+    logging.warning("⚠️ Live Search disabled (Dependency missing).")
 
 # --- 1. CONFIGURATION & LOGGING ---
 logging.basicConfig(level=logging.INFO)
@@ -37,12 +36,11 @@ class AgentNodes(str, Enum):
     EVIDENCE_AUDITOR = "evidence_auditor"
     SENIOR_COUNSEL = "senior_counsel"
 
-# Centralized Prompts
 PROMPTS = {
     "translation": "Translate to English for legal search keywords: '{query}'",
-    "video_analysis": "Analyze this video evidence. 1. Chronologically describe the events. 2. Identify any potential illegal acts (assault, theft, negligence). 3. Transcribe any audible dialogue.",
-    "audio_analysis": "Listen to this audio evidence. 1. Transcribe the conversation accurately. 2. Identify the emotional tone (threatening, scared, calm). 3. Identify potential threats.",
-    "image_analysis": "Analyze this image. If it is a document, transcribe the text. If it is a scene, describe it relevant to a legal case.",
+    "video_analysis": "Analyze this video evidence. 1. Chronologically describe the events. 2. Identify any potential illegal acts. 3. Transcribe dialogue.",
+    "audio_analysis": "Listen to this audio. 1. Transcribe conversation. 2. Detect emotional tone. 3. Identify threats.",
+    "image_analysis": "Analyze this image. If text, transcribe it. If scene, describe legal relevance.",
     "senior_counsel": """
         You are 'Justitia', an AI Legal Co-Counsel.
         USER CONVERSATION: {history}
@@ -52,8 +50,9 @@ PROMPTS = {
         
         INSTRUCTIONS: 
         1. Answer the legal query directly.
-        2. Cite specific IPC/BNS sections from the evidence or database.
-        3. Output in English (Translation is handled separately).
+        2. IF 'LIVE WEB UPDATES' contradicts 'LEGAL PRECEDENTS', prioritize Live Updates.
+        3. Cite specific sections.
+        4. Output in English.
     """
 }
 
@@ -76,7 +75,7 @@ def get_credentials() -> Dict[str, str]:
 CREDS = get_credentials()
 if not CREDS["GOOGLE_API_KEY"]: st.stop()
 
-# --- 3. AI TOOLS INITIALIZATION ---
+# --- 3. AI TOOLS ---
 @st.cache_resource
 def get_ai_tools():
     llm = ChatGoogleGenerativeAI(
@@ -85,22 +84,26 @@ def get_ai_tools():
         temperature=0.3,
         safety_settings={HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE}
     )
-    
     client = QdrantClient(url=CREDS["QDRANT_URL"], api_key=CREDS["QDRANT_API_KEY"], prefer_grpc=False, timeout=60)
     try: client.get_collection("response_cache")
     except: client.create_collection("response_cache", vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE))
-
     encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
     
-    # Force None for search to ensure stability
+    # Safe Search Tool Init
     web_search = None
-    
+    if SEARCH_AVAILABLE:
+        try:
+            web_search = DuckDuckGoSearchRun()
+        except Exception:
+            web_search = None # Fallback if init fails
+
     return llm, client, encoder, web_search
 
 llm, client, encoder, web_search = get_ai_tools()
 
-# --- 4. OPTIMIZATION HELPERS ---
+# --- 4. HELPERS ---
 def robust_language_check(text: str) -> bool:
+    if not text: return False
     try: return detect(text) != 'en' 
     except LangDetectException: return False 
 
@@ -115,20 +118,18 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
     if sensitive_mode: return
     try:
         client.upsert(collection_name="response_cache", points=[models.PointStruct(
-            id=abs(hash(query)) % (10**18), 
-            vector=encoder.encode(query).tolist(), 
-            payload={"query": query, "answer": answer}
+            id=abs(hash(query)) % (10**18), vector=encoder.encode(query).tolist(), payload={"query": query, "answer": answer}
         )])
     except: pass
 
-# --- 5. STATE MANAGEMENT ---
+# --- 5. STATE ---
 class AgentState(TypedDict):
     messages: List[str]
     context_data: Annotated[List[str], operator.add] 
     file_data: Optional[Dict[str, Any]]
     is_incognito: bool
 
-# --- 6. AGENT FUNCTIONS ---
+# --- 6. AGENTS ---
 
 def parallel_router(state: AgentState) -> List[str]:
     agents = []
@@ -137,63 +138,80 @@ def parallel_router(state: AgentState) -> List[str]:
         agents.append(AgentNodes.AMENDMENT_WATCHDOG)
     if state.get("file_data"):
         agents.append(AgentNodes.EVIDENCE_AUDITOR)
-    if not agents:
-        return [AgentNodes.SENIOR_COUNSEL]
-    return agents
+    return agents if agents else [AgentNodes.SENIOR_COUNSEL]
 
 def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
     if not state.get('messages'): return {"context_data": []}
     raw_query = state['messages'][-1].split("User: ")[-1]
-    search_query = raw_query
+    
     try:
+        search_query = raw_query
         if robust_language_check(raw_query):
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
+        
         hits = client.query_points("legal_knowledge", query=encoder.encode(search_query).tolist(), limit=5, with_payload=True).points
         if not hits: return {"context_data": [f"Legal Clerk: No specific laws found for {search_query}."]}
+        
         results = [f"- {h.payload.get('full_text', 'Law')}" for h in hits]
         return {"context_data": ["LEGAL PRECEDENTS (Static DB):\n" + "\n".join(results)]}
     except Exception as e:
         return {"context_data": [f"Legal Clerk Error: {e}"]}
 
 def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
-    """Agent E: Live Internet Search (DISABLED SAFELY)"""
-    # Simply return empty list if disabled, NO CRASH
-    return {"context_data": []}
+    """Safe Watchdog: Returns empty list if tool is missing."""
+    if not web_search: return {"context_data": []}
+    if not state.get('messages'): return {"context_data": []}
+    
+    query = state['messages'][-1].split("User: ")[-1]
+    try:
+        res = web_search.invoke(f"latest legal amendments supreme court judgments {query} India 2024 2025")
+        return {"context_data": [f"LIVE WEB UPDATES:\n{res}"]}
+    except Exception:
+        return {"context_data": []} # Fail silently
 
 def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
     file_data = state.get("file_data")
     if not file_data: return {"context_data": []}
     
-    file_name = file_data["name"].lower()
-    file_type = file_data["type"]
-    file_bytes = file_data["bytes"]
+    # --- CRITICAL FIX: Handle NoneType in file_type safely ---
+    file_name = file_data.get("name", "").lower()
+    file_type = file_data.get("type", "") or "" # Converts None to ""
+    file_bytes = file_data.get("bytes")
 
     try:
-        analysis_result = ""
+        res = ""
         if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov')):
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["video_analysis"]}, {"type":"media", "mime_type":"video/mp4", "data":b64}])
-            analysis_result = f"VIDEO ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
+            res = f"VIDEO ANALYSIS:\n{llm.invoke([msg]).content}"
+            
         elif "audio" in file_type or file_name.endswith(('.mp3', '.wav')):
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["audio_analysis"]}, {"type":"media", "mime_type":"audio/mp3", "data":b64}])
-            analysis_result = f"AUDIO ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
+            res = f"AUDIO ANALYSIS:\n{llm.invoke([msg]).content}"
+            
         elif "image" in file_type:
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["image_analysis"]}, {"type":"image_url", "image_url":{"url":f"data:image/jpeg;base64,{b64}"}}])
-            analysis_result = f"IMAGE ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
+            res = f"IMAGE ANALYSIS:\n{llm.invoke([msg]).content}"
+            
         elif "pdf" in file_type:
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-            analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"
+            res = f"FILE TEXT:\n{text[:4000]}"
             
-        return {"context_data": [analysis_result] if analysis_result else []}
+        return {"context_data": [res] if res else []}
     except Exception as e:
         return {"context_data": [f"Evidence Auditor Error: {e}"]}
 
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
-    context_list = state.get('context_data', [])
+    
+    # --- CRITICAL FIX: Handle NoneType in context_data safely ---
+    raw_context = state.get('context_data')
+    # Force it to be a list if it's None
+    context_list = raw_context if isinstance(raw_context, list) else []
+    
     combined_context = "\n\n".join(context_list) if context_list else "No evidence found."
     is_incognito = state.get("is_incognito", False)
     user_query = history[-1] if history else ""
@@ -205,8 +223,7 @@ def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     try:
         formatted_prompt = PROMPTS["senior_counsel"].format(history=history, context=combined_context)
         answer = llm.invoke(formatted_prompt).content
-        if not state.get("file_data"):
-            store_in_cache(user_query, answer, is_incognito)
+        if not state.get("file_data"): store_in_cache(user_query, answer, is_incognito)
         return {"messages": [answer]}
     except Exception as e:
         return {"messages": [f"Senior Counsel Error: {e}"]}
