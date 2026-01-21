@@ -116,11 +116,20 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
         )])
     except: pass
 
-# --- 5. STATE ---
+# --- 5. STATE & SAFETY REDUCER ---
+
+# CRITICAL FIX: Custom Reducer that handles NoneType gracefully
+def add_messages_safe(existing: Optional[List], new: Optional[List]) -> List:
+    if existing is None:
+        existing = []
+    if new is None:
+        new = []
+    return existing + new
+
 class AgentState(TypedDict):
     messages: List[str]
-    # Uses operator.add to merge parallel outputs
-    context_data: Annotated[List[str], operator.add] 
+    # Use CUSTOM REDUCER instead of operator.add
+    context_data: Annotated[List[str], add_messages_safe] 
     file_data: Optional[Dict[str, Any]]
     is_incognito: bool
 
@@ -167,8 +176,7 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
     file_data = state.get("file_data")
     if not file_data: return {"context_data": []}
     
-    # --- CRITICAL FIX: Safe Get with Fallback ---
-    # This prevents "NoneType is not iterable" if type is None
+    # Safe Get
     file_name = file_data.get("name", "").lower()
     file_type = file_data.get("type", "") or "" 
     file_bytes = file_data.get("bytes")
@@ -202,11 +210,12 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
     
-    # --- CRITICAL FIX: Handle None Context ---
+    # --- HANDLING MISSING CONTEXT SAFELY ---
     raw_context = state.get('context_data')
-    context_list = raw_context if isinstance(raw_context, list) else []
-    
-    combined_context = "\n\n".join(context_list) if context_list else "No evidence found."
+    if raw_context is None:
+        raw_context = []
+        
+    combined_context = "\n\n".join(raw_context) if raw_context else "No evidence found."
     is_incognito = state.get("is_incognito", False)
     user_query = history[-1] if history else ""
     
