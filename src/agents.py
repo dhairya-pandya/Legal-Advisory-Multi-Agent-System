@@ -16,7 +16,12 @@ from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, H
 from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
-from langchain_community.tools import DuckDuckGoSearchRun # <--- NEW WATCHDOG TOOL
+try:
+    from langchain_community.tools import DuckDuckGoSearchRun
+    SEARCH_AVAILABLE = True
+except ImportError:
+    SEARCH_AVAILABLE = False
+    logging.warning("⚠️ DuckDuckGo Search not found. Live updates will be disabled.")
 
 # --- 1. CONFIGURATION & LOGGING ---
 logging.basicConfig(level=logging.INFO)
@@ -87,7 +92,10 @@ def get_ai_tools():
 
     # 3. Embeddings & Search
     encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
-    web_search = DuckDuckGoSearchRun() # <--- Live Internet Search
+    if SEARCH_AVAILABLE:
+        web_search = DuckDuckGoSearchRun()
+    else:
+        web_search = None
     
     return llm, client, encoder, web_search
 
@@ -168,15 +176,17 @@ def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
         return {"context_data": [f"Legal Clerk Error: {e}"]}
 
 def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
-    """Agent E: Live Internet Search (The New Agent)"""
+    """Agent E: Live Internet Search"""
+    # 1. Check if tool exists
+    if not web_search:
+        return {"context_data": ["Watchdog Notice: Live search module is offline (Dependency missing)."]}
+
     if not state.get('messages'): return {"context_data": []}
     
     query = state['messages'][-1].split("User: ")[-1]
     try:
-        # We construct a query specifically for updates/amendments
         search_prompt = f"latest legal amendments supreme court judgments {query} India 2024 2025"
         live_results = web_search.invoke(search_prompt)
-        # RETURN AS LIST
         return {"context_data": [f"LIVE WEB UPDATES (Watchdog):\n{live_results}"]}
     except Exception as e:
         return {"context_data": [f"Watchdog Notice: Live search unavailable ({e})"]}
