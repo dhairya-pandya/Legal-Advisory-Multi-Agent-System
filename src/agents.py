@@ -2,9 +2,8 @@ import os
 import logging
 import base64
 import io
-import operator
 from enum import Enum
-from typing import TypedDict, List, Optional, Dict, Any, Annotated, Union
+from typing import TypedDict, List, Optional, Dict, Any
 import streamlit as st
 import pypdf
 import docx
@@ -17,13 +16,6 @@ from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 
-# --- ROBUST IMPORT FOR SEARCH ---
-try:
-    from duckduckgo_search import DDGS
-    HAS_SEARCH = True
-except ImportError:
-    HAS_SEARCH = False
-
 # --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("JustitiaBackend")
@@ -31,33 +23,22 @@ logger = logging.getLogger("JustitiaBackend")
 class AgentNodes(str, Enum):
     INTAKE = "intake_router"
     LEGAL_CLERK = "legal_clerk"
-    AMENDMENT_WATCHDOG = "amendment_watchdog"
     EVIDENCE_AUDITOR = "evidence_auditor"
     SENIOR_COUNSEL = "senior_counsel"
 
 PROMPTS = {
     "translation": "Translate to English for legal search keywords: '{query}'",
-    "field_extraction": """
-        Extract the most important legal fields from this query for a web search.
-        Query: "{query}"
-        Output strictly in this format:
-        KEYWORDS: [Key term 1, Key term 2]
-        ACTS: [Act Name 1, Act Name 2]
-        YEARS: [Year 1, Year 2]
-    """,
-    "video_analysis": "Analyze this video evidence. 1. Chronologically describe the events. 2. Identify illegal acts. 3. Transcribe dialogue.",
-    "audio_analysis": "Listen to this audio. 1. Transcribe conversation. 2. Identify emotional tone. 3. Identify threats.",
-    "image_analysis": "Analyze this image. If document, transcribe. If scene, describe legally.",
+    "video_analysis": "Analyze this video evidence. 1. Chronologically describe the events. 2. Identify any potential illegal acts (assault, theft, negligence). 3. Transcribe any audible dialogue.",
+    "audio_analysis": "Listen to this audio evidence. 1. Transcribe the conversation accurately. 2. Identify the emotional tone (threatening, scared, calm). 3. Identify potential threats.",
+    "image_analysis": "Analyze this image. If it is a document, transcribe the text. If it is a scene, describe it relevant to a legal case.",
     "senior_counsel": """
         You are 'Justitia', an AI Legal Co-Counsel.
         USER CONVERSATION: {history}
-        COMBINED EVIDENCE & RESEARCH:
-        {context}
+        EVIDENCE / ANALYSIS: {context}
         INSTRUCTIONS: 
         1. Answer the legal query directly.
-        2. IF 'LIVE WEB UPDATES' contradicts 'LEGAL PRECEDENTS', prioritize Live Updates.
-        3. Cite specific sections.
-        4. Output in English.
+        2. Cite specific IPC/BNS sections from the evidence or database.
+        3. Output in English (Translation is handled separately).
     """
 }
 
@@ -119,142 +100,93 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
         )])
     except: pass
 
-# --- 5. STATE MANAGEMENT ---
-
-def crash_proof_reducer(current: list, new: Union[list, str]) -> list:
-    if not isinstance(current, list):
-        current = [current] if current else []
-    if isinstance(new, str):
-        new = [new]
-    if not isinstance(new, list):
-        return current 
-    return current + new
-
+# --- 5. STATE (Simplified) ---
 class AgentState(TypedDict):
     messages: List[str]
-    context_data: Annotated[List[str], crash_proof_reducer] 
+    context_data: str  # <--- Back to String (Safe)
     file_data: Optional[Dict[str, Any]]
+    current_agent: str
     is_incognito: bool
 
 # --- 6. AGENTS ---
 
-def parallel_router(state: AgentState) -> List[str]:
-    agents = []
-    if state.get('messages'):
-        agents.append(AgentNodes.LEGAL_CLERK)
-        agents.append(AgentNodes.AMENDMENT_WATCHDOG)
+def intake_router(state: AgentState) -> Dict[str, str]:
     if state.get("file_data"):
-        agents.append(AgentNodes.EVIDENCE_AUDITOR)
-    if not agents: return [AgentNodes.SENIOR_COUNSEL]
-    return agents
+        return {"current_agent": AgentNodes.EVIDENCE_AUDITOR}
+    if not state.get('messages'):
+        return {"current_agent": AgentNodes.SENIOR_COUNSEL}
+    return {"current_agent": AgentNodes.LEGAL_CLERK}
 
-def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
-    if not state.get('messages'): return {"context_data": []}
+def legal_clerk(state: AgentState) -> Dict[str, str]:
+    if not state.get('messages'): return {"context_data": "No query."}
     
     raw_query = state['messages'][-1].split("User: ")[-1]
+    search_query = raw_query
     
     try:
-        search_query = raw_query
         if robust_language_check(raw_query):
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
         
         hits = client.query_points("legal_knowledge", query=encoder.encode(search_query).tolist(), limit=5, with_payload=True).points
-        
-        if not hits: 
-            return {"context_data": [f"Legal Clerk: No static laws found for {search_query}."]}
+        if not hits: return {"context_data": f"No specific laws found for: {search_query}"}
         
         results = [f"- {h.payload.get('full_text', 'Law')}" for h in hits]
-        return {"context_data": ["LEGAL PRECEDENTS (Static DB):\n" + "\n".join(results)]}
+        return {"context_data": "LEGAL PRECEDENTS (Database):\n" + "\n".join(results)}
     except Exception as e:
-        return {"context_data": [f"Legal Clerk Error: {e}"]}
+        return {"context_data": f"Database Error: {e}"}
 
-def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
-    if not state.get('messages'): return {"context_data": []}
-    
-    if not HAS_SEARCH:
-        return {"context_data": ["Watchdog Notice: Search module unavailable."]} 
-
-    query = state['messages'][-1].split("User: ")[-1]
-    
-    try:
-        extraction_prompt = PROMPTS["field_extraction"].format(query=query)
-        extracted_fields = llm.invoke(extraction_prompt).content
-        
-        search_terms = extracted_fields.replace("KEYWORDS:", "").replace("ACTS:", "").replace("YEARS:", "").replace("\n", " ")
-        final_search_query = f"{search_terms} latest supreme court judgments amendments India"
-        
-        results_text = "No relevant web results."
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(final_search_query, max_results=3)]
-            if results:
-                results_text = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
-        
-        return {"context_data": [f"LIVE WEB UPDATES (Watchdog):\nFields: {extracted_fields}\nResults:\n{results_text}"]}
-        
-    except Exception as e:
-        return {"context_data": [f"Watchdog Notice: Search failed ({e})."]}
-
-def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
+def evidence_auditor(state: AgentState) -> Dict[str, str]:
     file_data = state.get("file_data")
-    if not file_data: return {"context_data": []}
+    if not file_data: return {"context_data": "No file."}
     
-    # --- PARANOID SAFETY FIX ---
-    # We use .get() with defaults to ensure these variables are ALWAYS strings
+    # SAFETY: Force strings
     file_name = str(file_data.get("name", "")).lower()
-    file_type = str(file_data.get("type", "")).lower() # Forces None -> "none"
+    file_type = str(file_data.get("type", "")).lower()
     file_bytes = file_data.get("bytes")
-    
-    if not file_bytes:
-        return {"context_data": ["Error: File has no content."]}
-    # ---------------------------
+
+    if not file_bytes: return {"context_data": "Empty file."}
 
     try:
-        analysis_result = ""
-        
-        # Now safe to use 'in' because file_type is guaranteed to be a string
         # Video
-        if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov')):
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["video_analysis"]}, {"type":"media", "mime_type":"video/mp4", "data":b64}])
-            analysis_result = f"VIDEO ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
+            res = llm.invoke([msg])
+            return {"context_data": f"VIDEO ANALYSIS: {res.content}"}
         
         # Audio
-        elif "audio" in file_type or file_name.endswith(('.mp3', '.wav', '.m4a')):
+        elif "audio" in file_type or file_name.endswith(('.mp3', '.wav')):
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["audio_analysis"]}, {"type":"media", "mime_type":"audio/mp3", "data":b64}])
-            analysis_result = f"AUDIO ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
+            res = llm.invoke([msg])
+            return {"context_data": f"AUDIO ANALYSIS: {res.content}"}
         
         # Image
-        elif "image" in file_type or file_name.endswith(('.png', '.jpg', '.jpeg')):
+        elif "image" in file_type:
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["image_analysis"]}, {"type":"image_url", "image_url":{"url":f"data:image/jpeg;base64,{b64}"}}])
-            analysis_result = f"IMAGE ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
-        
-        # Docs
-        elif "pdf" in file_type or file_name.endswith('.pdf'):
+            res = llm.invoke([msg])
+            return {"context_data": f"IMAGE ANALYSIS: {res.content}"}
+            
+        # Documents
+        elif "pdf" in file_type:
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-            analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"
+            return {"context_data": f"FILE TEXT: {text[:4000]}"}
             
-        elif "word" in file_type or "document" in file_type or file_name.endswith(('.docx', '.doc')):
+        elif "word" in file_type or "doc" in file_type:
              doc = docx.Document(io.BytesIO(file_bytes))
              text = "\n".join([p.text for p in doc.paragraphs])
-             analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"
+             return {"context_data": f"FILE TEXT: {text[:4000]}"}
 
-        # Guarantee List Return
-        return {"context_data": [analysis_result] if analysis_result else []}
+        return {"context_data": "File processed but type unclear."}
         
     except Exception as e:
-        # Return error as data so the system keeps running
-        return {"context_data": [f"Evidence Auditor Error: {str(e)}"]}
+        return {"context_data": f"Analysis Failed: {e}"}
 
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
-    
-    # Safe join because crash_proof_reducer ensures this is always a list
-    context_list = state.get('context_data', [])
-    combined_context = "\n\n".join(context_list) if context_list else "No evidence found."
-    
+    context = state.get('context_data', "No evidence.")
     is_incognito = state.get("is_incognito", False)
     user_query = history[-1] if history else ""
     
@@ -263,7 +195,7 @@ def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
         if cached: return {"messages": [f"**(Cached)** {cached}"]}
 
     try:
-        formatted_prompt = PROMPTS["senior_counsel"].format(history=history, context=combined_context)
+        formatted_prompt = PROMPTS["senior_counsel"].format(history=history, context=context)
         answer = llm.invoke(formatted_prompt).content
         
         if not state.get("file_data"):
@@ -271,26 +203,28 @@ def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
             
         return {"messages": [answer]}
     except Exception as e:
-        return {"messages": [f"Senior Counsel Error: {e}"]}
+        return {"messages": [f"Error: {e}"]}
 
-# --- 7. WORKFLOW ---
+# --- 7. WORKFLOW (Linear & Safe) ---
 workflow = StateGraph(AgentState)
-workflow.add_node(AgentNodes.INTAKE, lambda s: {}) 
+workflow.add_node(AgentNodes.INTAKE, intake_router)
 workflow.add_node(AgentNodes.LEGAL_CLERK, legal_clerk)
-workflow.add_node(AgentNodes.AMENDMENT_WATCHDOG, amendment_watchdog)
 workflow.add_node(AgentNodes.EVIDENCE_AUDITOR, evidence_auditor)
 workflow.add_node(AgentNodes.SENIOR_COUNSEL, senior_counsel)
 
 workflow.set_entry_point(AgentNodes.INTAKE)
 
 workflow.add_conditional_edges(
-    AgentNodes.INTAKE,
-    parallel_router,
-    [AgentNodes.LEGAL_CLERK, AgentNodes.AMENDMENT_WATCHDOG, AgentNodes.EVIDENCE_AUDITOR, AgentNodes.SENIOR_COUNSEL]
+    AgentNodes.INTAKE, 
+    lambda x: x['current_agent'], 
+    {
+        AgentNodes.LEGAL_CLERK: AgentNodes.LEGAL_CLERK,
+        AgentNodes.EVIDENCE_AUDITOR: AgentNodes.EVIDENCE_AUDITOR,
+        AgentNodes.SENIOR_COUNSEL: AgentNodes.SENIOR_COUNSEL
+    }
 )
 
 workflow.add_edge(AgentNodes.LEGAL_CLERK, AgentNodes.SENIOR_COUNSEL)
-workflow.add_edge(AgentNodes.AMENDMENT_WATCHDOG, AgentNodes.SENIOR_COUNSEL)
 workflow.add_edge(AgentNodes.EVIDENCE_AUDITOR, AgentNodes.SENIOR_COUNSEL)
 workflow.add_edge(AgentNodes.SENIOR_COUNSEL, END)
 
