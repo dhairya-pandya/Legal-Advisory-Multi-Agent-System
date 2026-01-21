@@ -2,7 +2,6 @@ import os
 import logging
 import base64
 import io
-
 from enum import Enum
 from typing import TypedDict, List, Optional, Dict, Any
 import streamlit as st
@@ -10,27 +9,34 @@ import pypdf
 import docx
 
 # --- THIRD PARTY LIBRARIES ---
-from langdetect import detect, LangDetectException
-from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
-from langchain_core.messages import HumanMessage
-from qdrant_client import QdrantClient, models
-from sentence_transformers import SentenceTransformer
+try:
+    from langdetect import detect, LangDetectException
+    from langgraph.graph import StateGraph, END
+    from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
+    from langchain_core.messages import HumanMessage
+    from qdrant_client import QdrantClient, models
+    from sentence_transformers import SentenceTransformer
+except ImportError as e:
+    st.error(f"❌ Missing Dependency: {e}. Please update requirements.txt")
+    st.stop()
 
 # --- SEARCH BYPASS (PREVENTS CRASH IF LIBRARY MISSING) ---
+SEARCH_AVAILABLE = False
+web_search = None
 try:
     from langchain_community.tools import DuckDuckGoSearchRun
+    # Try initializing to catch internal errors early
+    _test = DuckDuckGoSearchRun()
     SEARCH_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    logging.warning(f"⚠️ Live Search disabled: {e}")
     SEARCH_AVAILABLE = False
-    logging.warning("⚠️ Live Search disabled (Dependency missing).")
 
 # --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("JustitiaBackend")
 
 class AgentNodes(str, Enum):
-
     LEGAL_CLERK = "legal_clerk"
     AMENDMENT_WATCHDOG = "amendment_watchdog"
     EVIDENCE_AUDITOR = "evidence_auditor"
@@ -73,7 +79,9 @@ def get_credentials() -> Dict[str, str]:
     return creds
 
 CREDS = get_credentials()
-if not CREDS["GOOGLE_API_KEY"]: st.stop()
+if not CREDS["GOOGLE_API_KEY"]: 
+    st.error("Missing GOOGLE_API_KEY. Check secrets or config.")
+    st.stop()
 
 # --- 3. AI TOOLS ---
 @st.cache_resource
@@ -84,18 +92,22 @@ def get_ai_tools():
         temperature=0.3,
         safety_settings={HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE}
     )
+    
     client = QdrantClient(url=CREDS["QDRANT_URL"], api_key=CREDS["QDRANT_API_KEY"], prefer_grpc=False, timeout=60)
     try: client.get_collection("response_cache")
     except: client.create_collection("response_cache", vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE))
+    
+    # Check cache for model to avoid redownloading
     encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
 
-    web_search = None
+    search_tool = None
     if SEARCH_AVAILABLE:
-        try: web_search = DuckDuckGoSearchRun()
-        except: web_search = None
+        try: search_tool = DuckDuckGoSearchRun()
+        except: pass
 
-    return llm, client, encoder, web_search
+    return llm, client, encoder, search_tool
 
+# Initialize Global Tools
 llm, client, encoder, web_search = get_ai_tools()
 
 # --- 4. HELPERS ---
@@ -119,18 +131,10 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
         )])
     except: pass
 
-# --- 5. STATE (Back to Simple String) ---
-
-
-
-
-
-
-
+# --- 5. STATE ---
 class AgentState(TypedDict):
     messages: List[str]
-    context_data: str  # <--- Stable String
-
+    context_data: str 
     file_data: Optional[Dict[str, Any]]
     is_incognito: bool
 
@@ -140,13 +144,6 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
     if not state.get('messages'): return {"context_data": ""}
     
     current_context = state.get("context_data", "")
-
-
-
-
-
-
-
     raw_query = state['messages'][-1].split("User: ")[-1]
 
     try:
@@ -154,10 +151,19 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
         if robust_language_check(raw_query):
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
 
-        hits = client.query_points("legal_knowledge", query=encoder.encode(search_query).tolist(), limit=5, with_payload=True).points
+        # TARGETED SEARCH (DENSE VECTOR)
+        # Note: We use search() method to be safe with named vectors if they exist, 
+        # or fallback to default if your setup changed.
+        try:
+             # Try searching specifically in "dense" vector first (based on your previous screenshot)
+            hits = client.search(collection_name="legal_knowledge", query_vector=("dense", encoder.encode(search_query).tolist()), limit=5)
+        except:
+            # Fallback to default unnamed vector
+            hits = client.search(collection_name="legal_knowledge", query_vector=encoder.encode(search_query).tolist(), limit=5)
+
         if not hits: return {"context_data": current_context}
 
-        results = [f"- {h.payload.get('full_text', 'Law')}" for h in hits]
+        results = [f"- {h.payload.get('full_text', h.payload.get('text', 'Law'))}" for h in hits]
         new_data = "\nLEGAL PRECEDENTS (Static DB):\n" + "\n".join(results) + "\n"
         return {"context_data": current_context + new_data}
         
@@ -181,10 +187,11 @@ def evidence_auditor(state: AgentState) -> Dict[str, str]:
     file_data = state.get("file_data")
     if not file_data: return {"context_data": current_context}
 
-    # Safe unpacking
     file_name = file_data.get("name", "").lower()
-    file_type = file_data.get("type", "") or "" 
+    file_type = str(file_data.get("type", "") or "").lower()
     file_bytes = file_data.get("bytes")
+
+    if not file_bytes: return {"context_data": current_context}
 
     try:
         res = ""
@@ -204,6 +211,10 @@ def evidence_auditor(state: AgentState) -> Dict[str, str]:
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
             res = f"FILE TEXT:\n{text[:4000]}"
+        elif "word" in file_type or "doc" in file_type:
+             doc = docx.Document(io.BytesIO(file_bytes))
+             text = "\n".join([p.text for p in doc.paragraphs])
+             res = f"FILE TEXT:\n{text[:4000]}"
 
         return {"context_data": current_context + "\nEVIDENCE:\n" + res + "\n"}
     except Exception as e:
@@ -212,13 +223,7 @@ def evidence_auditor(state: AgentState) -> Dict[str, str]:
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
     context = state.get('context_data', "No evidence.")
-
-
-
-
-
-
-
+    
     is_incognito = state.get("is_incognito", False)
     user_query = history[-1] if history else ""
 
@@ -234,21 +239,18 @@ def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     except Exception as e:
         return {"messages": [f"Senior Counsel Error: {e}"]}
 
-# --- 7. WORKFLOW (LINEAR CHAIN) ---
+# --- 7. WORKFLOW ---
 workflow = StateGraph(AgentState)
-
 workflow.add_node(AgentNodes.LEGAL_CLERK, legal_clerk)
 workflow.add_node(AgentNodes.AMENDMENT_WATCHDOG, amendment_watchdog)
 workflow.add_node(AgentNodes.EVIDENCE_AUDITOR, evidence_auditor)
 workflow.add_node(AgentNodes.SENIOR_COUNSEL, senior_counsel)
 
-# Set Linear Flow: Clerk -> Watchdog -> Auditor -> Counsel
+# Linear Chain
 workflow.set_entry_point(AgentNodes.LEGAL_CLERK)
 workflow.add_edge(AgentNodes.LEGAL_CLERK, AgentNodes.AMENDMENT_WATCHDOG)
 workflow.add_edge(AgentNodes.AMENDMENT_WATCHDOG, AgentNodes.EVIDENCE_AUDITOR)
-
-
-
-
 workflow.add_edge(AgentNodes.EVIDENCE_AUDITOR, AgentNodes.SENIOR_COUNSEL)
 workflow.add_edge(AgentNodes.SENIOR_COUNSEL, END)
+
+app = workflow.compile()
