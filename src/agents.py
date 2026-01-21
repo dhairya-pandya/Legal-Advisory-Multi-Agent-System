@@ -97,7 +97,7 @@ def get_ai_tools():
 
 llm, client, encoder = get_ai_tools()
 
-# --- 4. OPTIMIZATION HELPERS ---
+# --- 4. HELPERS ---
 def robust_language_check(text: str) -> bool:
     try: return detect(text) != 'en' 
     except LangDetectException: return False 
@@ -119,34 +119,24 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
         )])
     except: pass
 
-# --- 5. STATE MANAGEMENT (THE SILVER BULLET FIX) ---
+# --- 5. STATE MANAGEMENT ---
 
 def crash_proof_reducer(current: list, new: Union[list, str]) -> list:
-    """
-    A robust reducer that handles bad inputs gracefully.
-    If 'new' is a string, it wraps it in a list so addition doesn't fail.
-    """
     if not isinstance(current, list):
         current = [current] if current else []
-    
     if isinstance(new, str):
-        # FIX: The exact error you saw happened because 'new' was a string.
-        # This line forces it to be a list before adding.
         new = [new]
-    
     if not isinstance(new, list):
-        return current # Ignore bad data
-        
+        return current 
     return current + new
 
 class AgentState(TypedDict):
     messages: List[str]
-    # Replaced 'operator.add' with 'crash_proof_reducer'
     context_data: Annotated[List[str], crash_proof_reducer] 
     file_data: Optional[Dict[str, Any]]
     is_incognito: bool
 
-# --- 6. AGENT FUNCTIONS ---
+# --- 6. AGENTS ---
 
 def parallel_router(state: AgentState) -> List[str]:
     agents = []
@@ -181,7 +171,6 @@ def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
 def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
     if not state.get('messages'): return {"context_data": []}
     
-    # Graceful fallback if dependency is missing
     if not HAS_SEARCH:
         return {"context_data": ["Watchdog Notice: Search module unavailable."]} 
 
@@ -209,9 +198,13 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
     file_data = state.get("file_data")
     if not file_data: return {"context_data": []}
     
-    file_name = file_data["name"].lower()
-    file_type = file_data["type"]
+    # --- FIX STARTS HERE ---
+    file_name = file_data.get("name", "").lower()
+    
+    # Safe get: if type is None, default to empty string to prevent "NoneType not iterable"
+    file_type = file_data.get("type") or "" 
     file_bytes = file_data["bytes"]
+    # --- FIX ENDS HERE ---
 
     try:
         analysis_result = ""
@@ -244,7 +237,6 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
              text = "\n".join([p.text for p in doc.paragraphs])
              analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"
 
-        # Important: Return a list even if it's one item
         return {"context_data": [analysis_result] if analysis_result else []}
         
     except Exception as e:
