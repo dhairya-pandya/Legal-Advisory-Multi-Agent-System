@@ -142,7 +142,7 @@ def main():
         inputs = {
             "messages": chat_history,
             "is_incognito": is_incognito,
-            "context_data": []  # <--- CRITICAL INITIALIZATION
+            "context_data": "" # <--- Simple String Initialization
         }
         
         if file_val:
@@ -164,12 +164,10 @@ def main():
                             # Traceability Log
                             with st.sidebar.expander(f"🔹 Active: {agent_name}", expanded=True):
                                 st.caption("Status: Processing...")
-                                # Handle List output from Parallel Agents
+                                # Simple String Display
                                 if "context_data" in agent_state:
-                                    data = agent_state["context_data"]
-                                    # Convert list to string for display if needed
-                                    display_text = str(data) if isinstance(data, list) else data
-                                    st.code(display_text[:200] + "...", language="text")
+                                    snippet = agent_state["context_data"][-200:] # Show last 200 chars
+                                    st.code(snippet, language="text")
 
                             # Capture Final Message
                             if "messages" in agent_state:

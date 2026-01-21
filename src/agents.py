@@ -2,9 +2,8 @@ import os
 import logging
 import base64
 import io
-import operator
 from enum import Enum
-from typing import TypedDict, List, Optional, Dict, Any, Annotated
+from typing import TypedDict, List, Optional, Dict, Any
 import streamlit as st
 import pypdf
 import docx
@@ -23,13 +22,13 @@ try:
     SEARCH_AVAILABLE = True
 except ImportError:
     SEARCH_AVAILABLE = False
+    logging.warning("⚠️ Live Search disabled (Dependency missing).")
 
 # --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("JustitiaBackend")
 
 class AgentNodes(str, Enum):
-    INTAKE = "intake_router"
     LEGAL_CLERK = "legal_clerk"
     AMENDMENT_WATCHDOG = "amendment_watchdog"
     EVIDENCE_AUDITOR = "evidence_auditor"
@@ -43,7 +42,10 @@ PROMPTS = {
     "senior_counsel": """
         You are 'Justitia', an AI Legal Co-Counsel.
         USER CONVERSATION: {history}
-        EVIDENCE & RESEARCH: {context}
+        
+        COMBINED EVIDENCE & RESEARCH:
+        {context}
+        
         INSTRUCTIONS: 
         1. Answer the legal query directly.
         2. IF 'LIVE WEB UPDATES' contradicts 'LEGAL PRECEDENTS', prioritize Live Updates.
@@ -115,34 +117,19 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
         )])
     except: pass
 
-# --- 5. STATE & REDUCER (THE FIX) ---
-
-def reduce_list(existing: Optional[List], new: Optional[List]) -> List:
-    """Safely merges two lists, handling None values to prevent crashes."""
-    if existing is None: existing = []
-    if new is None: new = []
-    return existing + new
-
+# --- 5. STATE (Back to Simple String) ---
 class AgentState(TypedDict):
     messages: List[str]
-    # Replaced operator.add with our crash-proof reducer
-    context_data: Annotated[List[str], reduce_list] 
+    context_data: str  # <--- Stable String
     file_data: Optional[Dict[str, Any]]
     is_incognito: bool
 
 # --- 6. AGENTS ---
 
-def parallel_router(state: AgentState) -> List[str]:
-    agents = []
-    if state.get('messages'):
-        agents.append(AgentNodes.LEGAL_CLERK)
-        agents.append(AgentNodes.AMENDMENT_WATCHDOG)
-    if state.get("file_data"):
-        agents.append(AgentNodes.EVIDENCE_AUDITOR)
-    return agents if agents else [AgentNodes.SENIOR_COUNSEL]
-
-def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
-    if not state.get('messages'): return {"context_data": []}
+def legal_clerk(state: AgentState) -> Dict[str, str]:
+    if not state.get('messages'): return {"context_data": ""}
+    
+    current_context = state.get("context_data", "")
     raw_query = state['messages'][-1].split("User: ")[-1]
     
     try:
@@ -151,28 +138,31 @@ def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
         
         hits = client.query_points("legal_knowledge", query=encoder.encode(search_query).tolist(), limit=5, with_payload=True).points
-        if not hits: return {"context_data": [f"Legal Clerk: No specific laws found for {search_query}."]}
+        if not hits: return {"context_data": current_context}
         
         results = [f"- {h.payload.get('full_text', 'Law')}" for h in hits]
-        return {"context_data": ["LEGAL PRECEDENTS (Static DB):\n" + "\n".join(results)]}
+        new_data = "\nLEGAL PRECEDENTS (Static DB):\n" + "\n".join(results) + "\n"
+        return {"context_data": current_context + new_data}
+        
     except Exception as e:
-        return {"context_data": [f"Legal Clerk Error: {e}"]}
+        return {"context_data": current_context + f"\n[Clerk Error: {e}]\n"}
 
-def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
-    # ALWAYS return a list, never None
-    if not web_search: return {"context_data": []}
-    if not state.get('messages'): return {"context_data": []}
+def amendment_watchdog(state: AgentState) -> Dict[str, str]:
+    current_context = state.get("context_data", "")
+    if not web_search: return {"context_data": current_context}
+    if not state.get('messages'): return {"context_data": current_context}
     
     query = state['messages'][-1].split("User: ")[-1]
     try:
         res = web_search.invoke(f"latest legal amendments supreme court judgments {query} India 2024 2025")
-        return {"context_data": [f"LIVE WEB UPDATES:\n{res}"]}
+        return {"context_data": current_context + f"\nLIVE WEB UPDATES:\n{res}\n"}
     except Exception:
-        return {"context_data": []}
+        return {"context_data": current_context}
 
-def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
+def evidence_auditor(state: AgentState) -> Dict[str, str]:
+    current_context = state.get("context_data", "")
     file_data = state.get("file_data")
-    if not file_data: return {"context_data": []}
+    if not file_data: return {"context_data": current_context}
     
     # Safe unpacking
     file_name = file_data.get("name", "").lower()
@@ -198,19 +188,14 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
             res = f"FILE TEXT:\n{text[:4000]}"
             
-        return {"context_data": [res] if res else []}
+        return {"context_data": current_context + "\nEVIDENCE:\n" + res + "\n"}
     except Exception as e:
-        return {"context_data": [f"Evidence Auditor Error: {e}"]}
+        return {"context_data": current_context + f"\n[Auditor Error: {e}]\n"}
 
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
+    context = state.get('context_data', "No evidence.")
     
-    # --- CRITICAL FIX: Explicit None check before join ---
-    raw_context = state.get('context_data')
-    if raw_context is None:
-        raw_context = []
-        
-    combined_context = "\n\n".join(raw_context) if raw_context else "No evidence found."
     is_incognito = state.get("is_incognito", False)
     user_query = history[-1] if history else ""
     
@@ -219,29 +204,24 @@ def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
         if cached: return {"messages": [f"**(Cached)** {cached}"]}
 
     try:
-        formatted_prompt = PROMPTS["senior_counsel"].format(history=history, context=combined_context)
+        formatted_prompt = PROMPTS["senior_counsel"].format(history=history, context=context)
         answer = llm.invoke(formatted_prompt).content
         if not state.get("file_data"): store_in_cache(user_query, answer, is_incognito)
         return {"messages": [answer]}
     except Exception as e:
         return {"messages": [f"Senior Counsel Error: {e}"]}
 
-# --- 7. WORKFLOW ---
+# --- 7. WORKFLOW (LINEAR CHAIN) ---
 workflow = StateGraph(AgentState)
-workflow.add_node(AgentNodes.INTAKE, lambda s: {})
 workflow.add_node(AgentNodes.LEGAL_CLERK, legal_clerk)
 workflow.add_node(AgentNodes.AMENDMENT_WATCHDOG, amendment_watchdog)
 workflow.add_node(AgentNodes.EVIDENCE_AUDITOR, evidence_auditor)
 workflow.add_node(AgentNodes.SENIOR_COUNSEL, senior_counsel)
 
-workflow.set_entry_point(AgentNodes.INTAKE)
-workflow.add_conditional_edges(
-    AgentNodes.INTAKE,
-    parallel_router,
-    [AgentNodes.LEGAL_CLERK, AgentNodes.AMENDMENT_WATCHDOG, AgentNodes.EVIDENCE_AUDITOR, AgentNodes.SENIOR_COUNSEL]
-)
-workflow.add_edge(AgentNodes.LEGAL_CLERK, AgentNodes.SENIOR_COUNSEL)
-workflow.add_edge(AgentNodes.AMENDMENT_WATCHDOG, AgentNodes.SENIOR_COUNSEL)
+# Set Linear Flow: Clerk -> Watchdog -> Auditor -> Counsel
+workflow.set_entry_point(AgentNodes.LEGAL_CLERK)
+workflow.add_edge(AgentNodes.LEGAL_CLERK, AgentNodes.AMENDMENT_WATCHDOG)
+workflow.add_edge(AgentNodes.AMENDMENT_WATCHDOG, AgentNodes.EVIDENCE_AUDITOR)
 workflow.add_edge(AgentNodes.EVIDENCE_AUDITOR, AgentNodes.SENIOR_COUNSEL)
 workflow.add_edge(AgentNodes.SENIOR_COUNSEL, END)
 
