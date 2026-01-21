@@ -117,7 +117,16 @@ def main():
 
     # B. Input Handling
     final_input = None
-    
+
+    if file_val:
+            safe_type = file_val.type if file_val.type else ""
+            
+            inputs["file_data"] = {
+                "name": file_val.name, 
+                "type": safe_type,  # <--- FIXED
+                "bytes": file_val.getvalue()
+            }
+            st.sidebar.success(f"📎 Analyzing: {file_val.name}")
     # Priority 1: Voice
     if audio_val:
         transcription = process_voice_input(audio_val)
