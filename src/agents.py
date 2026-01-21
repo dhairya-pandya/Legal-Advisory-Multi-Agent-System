@@ -17,13 +17,12 @@ from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 
-# --- EMERGENCY FIX: BYPASS SEARCH TO PREVENT CRASH ---
+# --- SEARCH BYPASS (PREVENTS CRASH IF LIBRARY MISSING) ---
 try:
     from langchain_community.tools import DuckDuckGoSearchRun
     SEARCH_AVAILABLE = True
 except ImportError:
     SEARCH_AVAILABLE = False
-    logging.warning("⚠️ Live Search disabled (Dependency missing).")
 
 # --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
@@ -116,20 +115,18 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
         )])
     except: pass
 
-# --- 5. STATE & SAFETY REDUCER ---
+# --- 5. STATE & REDUCER (THE FIX) ---
 
-# CRITICAL FIX: Custom Reducer that handles NoneType gracefully
-def add_messages_safe(existing: Optional[List], new: Optional[List]) -> List:
-    if existing is None:
-        existing = []
-    if new is None:
-        new = []
+def reduce_list(existing: Optional[List], new: Optional[List]) -> List:
+    """Safely merges two lists, handling None values to prevent crashes."""
+    if existing is None: existing = []
+    if new is None: new = []
     return existing + new
 
 class AgentState(TypedDict):
     messages: List[str]
-    # Use CUSTOM REDUCER instead of operator.add
-    context_data: Annotated[List[str], add_messages_safe] 
+    # Replaced operator.add with our crash-proof reducer
+    context_data: Annotated[List[str], reduce_list] 
     file_data: Optional[Dict[str, Any]]
     is_incognito: bool
 
@@ -162,6 +159,7 @@ def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
         return {"context_data": [f"Legal Clerk Error: {e}"]}
 
 def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
+    # ALWAYS return a list, never None
     if not web_search: return {"context_data": []}
     if not state.get('messages'): return {"context_data": []}
     
@@ -176,7 +174,7 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
     file_data = state.get("file_data")
     if not file_data: return {"context_data": []}
     
-    # Safe Get
+    # Safe unpacking
     file_name = file_data.get("name", "").lower()
     file_type = file_data.get("type", "") or "" 
     file_bytes = file_data.get("bytes")
@@ -187,17 +185,14 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["video_analysis"]}, {"type":"media", "mime_type":"video/mp4", "data":b64}])
             res = f"VIDEO ANALYSIS:\n{llm.invoke([msg]).content}"
-            
         elif "audio" in file_type or file_name.endswith(('.mp3', '.wav')):
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["audio_analysis"]}, {"type":"media", "mime_type":"audio/mp3", "data":b64}])
             res = f"AUDIO ANALYSIS:\n{llm.invoke([msg]).content}"
-            
         elif "image" in file_type:
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["image_analysis"]}, {"type":"image_url", "image_url":{"url":f"data:image/jpeg;base64,{b64}"}}])
             res = f"IMAGE ANALYSIS:\n{llm.invoke([msg]).content}"
-            
         elif "pdf" in file_type:
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
@@ -210,7 +205,7 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
     
-    # --- HANDLING MISSING CONTEXT SAFELY ---
+    # --- CRITICAL FIX: Explicit None check before join ---
     raw_context = state.get('context_data')
     if raw_context is None:
         raw_context = []
