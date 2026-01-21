@@ -198,16 +198,20 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
     file_data = state.get("file_data")
     if not file_data: return {"context_data": []}
     
-    # --- FIX STARTS HERE ---
-    file_name = file_data.get("name", "").lower()
+    # --- PARANOID SAFETY FIX ---
+    # We use .get() with defaults to ensure these variables are ALWAYS strings
+    file_name = str(file_data.get("name", "")).lower()
+    file_type = str(file_data.get("type", "")).lower() # Forces None -> "none"
+    file_bytes = file_data.get("bytes")
     
-    # Safe get: if type is None, default to empty string to prevent "NoneType not iterable"
-    file_type = file_data.get("type") or "" 
-    file_bytes = file_data["bytes"]
-    # --- FIX ENDS HERE ---
+    if not file_bytes:
+        return {"context_data": ["Error: File has no content."]}
+    # ---------------------------
 
     try:
         analysis_result = ""
+        
+        # Now safe to use 'in' because file_type is guaranteed to be a string
         # Video
         if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov', '.mkv')):
             b64 = base64.b64encode(file_bytes).decode('utf-8')
@@ -227,20 +231,22 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
             analysis_result = f"IMAGE ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
         
         # Docs
-        elif "pdf" in file_type:
+        elif "pdf" in file_type or file_name.endswith('.pdf'):
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
             analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"
             
-        elif "word" in file_type or "document" in file_type:
+        elif "word" in file_type or "document" in file_type or file_name.endswith(('.docx', '.doc')):
              doc = docx.Document(io.BytesIO(file_bytes))
              text = "\n".join([p.text for p in doc.paragraphs])
              analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"
 
+        # Guarantee List Return
         return {"context_data": [analysis_result] if analysis_result else []}
         
     except Exception as e:
-        return {"context_data": [f"Evidence Auditor Error: {e}"]}
+        # Return error as data so the system keeps running
+        return {"context_data": [f"Evidence Auditor Error: {str(e)}"]}
 
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
