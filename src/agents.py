@@ -124,14 +124,40 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
     search_query = raw_query
     
     try:
+        # 1. Translate if needed
         if robust_language_check(raw_query):
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
         
-        hits = client.query_points("legal_knowledge", query=encoder.encode(search_query).tolist(), limit=5, with_payload=True).points
+        # 2. Encode the query
+        vector = encoder.encode(search_query).tolist()
+
+        # 3. SEARCH FIX: Target the 'dense' vector specifically
+        # The screenshot shows the vector is named "dense"
+        hits = client.search(
+            collection_name="legal_knowledge",
+            query_vector=("dense", vector), # Tuple syntax: ("vector_name", vector_data)
+            limit=5
+        )
+        
+        # 4. Fallback: If 'dense' fails, try default (robustness)
+        if not hits:
+            hits = client.search(
+                collection_name="legal_knowledge",
+                query_vector=vector, 
+                limit=5
+            )
+
         if not hits: return {"context_data": f"No specific laws found for: {search_query}"}
         
-        results = [f"- {h.payload.get('full_text', 'Law')}" for h in hits]
+        # 5. Extract Text (Handle various payload keys: 'full_text', 'text', or 'page_content')
+        results = []
+        for h in hits:
+            # We check multiple keys to be safe
+            content = h.payload.get('full_text') or h.payload.get('text') or h.payload.get('page_content') or "Legal Content"
+            results.append(f"- {content}")
+            
         return {"context_data": "LEGAL PRECEDENTS (Database):\n" + "\n".join(results)}
+
     except Exception as e:
         return {"context_data": f"Database Error: {e}"}
 
