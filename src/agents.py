@@ -13,10 +13,18 @@ import docx
 from langdetect import detect, LangDetectException
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
-from duckduckgo_search import DDGS
+
+# --- ROBUST IMPORT FOR SEARCH ---
+# We try to import the native library. If it fails, we set a flag so the app doesn't crash.
+try:
+    from duckduckgo_search import DDGS
+    HAS_SEARCH = True
+except ImportError:
+    HAS_SEARCH = False
+
 # --- 1. CONFIGURATION & LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("JustitiaBackend")
@@ -34,7 +42,6 @@ PROMPTS = {
     "field_extraction": """
         Extract the most important legal fields from this query for a web search.
         Query: "{query}"
-        
         Output strictly in this format:
         KEYWORDS: [Key term 1, Key term 2]
         ACTS: [Act Name 1, Act Name 2]
@@ -46,10 +53,8 @@ PROMPTS = {
     "senior_counsel": """
         You are 'Justitia', an AI Legal Co-Counsel.
         USER CONVERSATION: {history}
-        
         COMBINED EVIDENCE & RESEARCH:
         {context}
-        
         INSTRUCTIONS: 
         1. Answer the legal query directly.
         2. IF 'LIVE WEB UPDATES' contradicts 'LEGAL PRECEDENTS', prioritize the Live Web Updates.
@@ -93,13 +98,12 @@ def get_ai_tools():
     try: client.get_collection("response_cache")
     except: client.create_collection("response_cache", vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE))
 
-    # 3. Embeddings & Search
+    # 3. Embeddings
     encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
-    web_search = DuckDuckGoSearchRun()
     
-    return llm, client, encoder, web_search
+    return llm, client, encoder
 
-llm, client, encoder, web_search = get_ai_tools()
+llm, client, encoder = get_ai_tools()
 
 # --- 4. HELPERS ---
 def robust_language_check(text: str) -> bool:
@@ -161,35 +165,20 @@ def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
     except Exception as e:
         return {"context_data": [f"Legal Clerk Error: {e}"]}
 
-def query_duckduckgo(query: str, max_results: int = 3) -> str:
-    """
-    Directly queries DuckDuckGo without LangChain wrappers.
-    """
-    try:
-        with DDGS() as ddgs:
-            # .text() returns a list of dictionaries [{'title':..., 'body':...}]
-            results = [r for r in ddgs.text(query, max_results=max_results)]
-            
-            if not results:
-                return "No results found on the web."
-                
-            # Format nicely for the LLM
-            formatted = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
-            return formatted
-    except Exception as e:
-        return f"Search Error: {e}"
-
-# --- UPDATED AGENT ---
 def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
     """
-    Agent E: SMART Watchdog (Native Implementation).
+    Agent E: SMART Watchdog (Native Implementation with Safety Fallback).
     """
     if not state.get('messages'): return {"context_data": []}
     
+    # SAFETY CHECK: If import failed, return early.
+    if not HAS_SEARCH:
+        return {"context_data": ["Watchdog Notice: Search module unavailable (Dependency missing)."]}
+
     query = state['messages'][-1].split("User: ")[-1]
     
     try:
-        # STEP 1: Identify Fields (Same as before)
+        # STEP 1: Identify Fields
         extraction_prompt = PROMPTS["field_extraction"].format(query=query)
         extracted_fields = llm.invoke(extraction_prompt).content
         
@@ -197,13 +186,22 @@ def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
         search_terms = extracted_fields.replace("KEYWORDS:", "").replace("ACTS:", "").replace("YEARS:", "").replace("\n", " ")
         final_search_query = f"{search_terms} latest supreme court judgments amendments India"
         
-        # STEP 3: Execute Search (Using NEW Native Function)
-        live_results = query_duckduckgo(final_search_query)
+        # STEP 3: Execute Search (Native DDGS)
+        results_text = ""
+        with DDGS() as ddgs:
+            # Get top 3 results
+            results = [r for r in ddgs.text(final_search_query, max_results=3)]
+            if results:
+                results_text = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+            else:
+                results_text = "No relevant web results found."
         
-        return {"context_data": [f"LIVE WEB UPDATES (Watchdog):\nFields: {extracted_fields}\nResults: {live_results}"]}
+        return {"context_data": [f"LIVE WEB UPDATES (Watchdog):\nFields: {extracted_fields}\nResults:\n{results_text}"]}
         
     except Exception as e:
-        return {"context_data": [f"Watchdog Error: {e}"]}
+        # Graceful failure - log error but don't crash user session
+        logger.error(f"Watchdog Error: {e}")
+        return {"context_data": [f"Watchdog Notice: Search failed temporarily."]}
 
 def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
     file_data = state.get("file_data")
