@@ -16,7 +16,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, H
 from langchain_core.messages import HumanMessage, SystemMessage
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
-from langchain_community.tools import DuckDuckGoSearchRun
 from duckduckgo_search import DDGS
 # --- 1. CONFIGURATION & LOGGING ---
 logging.basicConfig(level=logging.INFO)
