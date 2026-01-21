@@ -4,7 +4,7 @@ import base64
 import io
 import operator
 from enum import Enum
-from typing import TypedDict, List, Optional, Dict, Any, Annotated
+from typing import TypedDict, List, Optional, Dict, Any, Annotated, Union
 import streamlit as st
 import pypdf
 import docx
@@ -97,7 +97,7 @@ def get_ai_tools():
 
 llm, client, encoder = get_ai_tools()
 
-# --- 4. HELPERS ---
+# --- 4. OPTIMIZATION HELPERS ---
 def robust_language_check(text: str) -> bool:
     try: return detect(text) != 'en' 
     except LangDetectException: return False 
@@ -119,15 +119,34 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
         )])
     except: pass
 
-# --- 5. STATE (CRITICAL FIX) ---
+# --- 5. STATE MANAGEMENT (THE SILVER BULLET FIX) ---
+
+def crash_proof_reducer(current: list, new: Union[list, str]) -> list:
+    """
+    A robust reducer that handles bad inputs gracefully.
+    If 'new' is a string, it wraps it in a list so addition doesn't fail.
+    """
+    if not isinstance(current, list):
+        current = [current] if current else []
+    
+    if isinstance(new, str):
+        # FIX: The exact error you saw happened because 'new' was a string.
+        # This line forces it to be a list before adding.
+        new = [new]
+    
+    if not isinstance(new, list):
+        return current # Ignore bad data
+        
+    return current + new
+
 class AgentState(TypedDict):
     messages: List[str]
-    # This operator.add requires ALL updates to be LISTS
-    context_data: Annotated[List[str], operator.add] 
+    # Replaced 'operator.add' with 'crash_proof_reducer'
+    context_data: Annotated[List[str], crash_proof_reducer] 
     file_data: Optional[Dict[str, Any]]
     is_incognito: bool
 
-# --- 6. AGENTS ---
+# --- 6. AGENT FUNCTIONS ---
 
 def parallel_router(state: AgentState) -> List[str]:
     agents = []
@@ -140,29 +159,29 @@ def parallel_router(state: AgentState) -> List[str]:
     return agents
 
 def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
-    if not state.get('messages'): return {"context_data": []} # List
+    if not state.get('messages'): return {"context_data": []}
     
     raw_query = state['messages'][-1].split("User: ")[-1]
-    search_query = raw_query
     
     try:
+        search_query = raw_query
         if robust_language_check(raw_query):
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
         
         hits = client.query_points("legal_knowledge", query=encoder.encode(search_query).tolist(), limit=5, with_payload=True).points
+        
         if not hits: 
-            return {"context_data": [f"Legal Clerk: No static laws found for {search_query}."]} # List
+            return {"context_data": [f"Legal Clerk: No static laws found for {search_query}."]}
         
         results = [f"- {h.payload.get('full_text', 'Law')}" for h in hits]
-        # GUARANTEE LIST: brackets around the joined string
-        return {"context_data": ["LEGAL PRECEDENTS (Static DB):\n" + "\n".join(results)]} 
+        return {"context_data": ["LEGAL PRECEDENTS (Static DB):\n" + "\n".join(results)]}
     except Exception as e:
-        return {"context_data": [f"Legal Clerk Error: {e}"]} # List
+        return {"context_data": [f"Legal Clerk Error: {e}"]}
 
 def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
     if not state.get('messages'): return {"context_data": []}
     
-    # SAFETY: Return LIST if search tool missing
+    # Graceful fallback if dependency is missing
     if not HAS_SEARCH:
         return {"context_data": ["Watchdog Notice: Search module unavailable."]} 
 
@@ -181,15 +200,14 @@ def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
             if results:
                 results_text = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
         
-        # GUARANTEE LIST
         return {"context_data": [f"LIVE WEB UPDATES (Watchdog):\nFields: {extracted_fields}\nResults:\n{results_text}"]}
         
     except Exception as e:
-        return {"context_data": [f"Watchdog Notice: Search failed ({e})."]} # List
+        return {"context_data": [f"Watchdog Notice: Search failed ({e})."]}
 
 def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
     file_data = state.get("file_data")
-    if not file_data: return {"context_data": []} # List
+    if not file_data: return {"context_data": []}
     
     file_name = file_data["name"].lower()
     file_type = file_data["type"]
@@ -197,31 +215,45 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
 
     try:
         analysis_result = ""
-        if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov')):
+        # Video
+        if "video" in file_type or file_name.endswith(('.mp4', '.avi', '.mov', '.mkv')):
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["video_analysis"]}, {"type":"media", "mime_type":"video/mp4", "data":b64}])
             analysis_result = f"VIDEO ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
-        elif "audio" in file_type or file_name.endswith(('.mp3', '.wav')):
+        
+        # Audio
+        elif "audio" in file_type or file_name.endswith(('.mp3', '.wav', '.m4a')):
             b64 = base64.b64encode(file_bytes).decode('utf-8')
             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["audio_analysis"]}, {"type":"media", "mime_type":"audio/mp3", "data":b64}])
             analysis_result = f"AUDIO ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
-        if "image" in file_type:
-             b64 = base64.b64encode(file_bytes).decode('utf-8')
-             msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["image_analysis"]}, {"type":"image_url", "image_url":{"url":f"data:image/jpeg;base64,{b64}"}}])
-             analysis_result = f"IMAGE ANALYSIS: {llm.invoke([msg]).content}"
+        
+        # Image
+        elif "image" in file_type or file_name.endswith(('.png', '.jpg', '.jpeg')):
+            b64 = base64.b64encode(file_bytes).decode('utf-8')
+            msg = HumanMessage(content=[{"type":"text", "text": PROMPTS["image_analysis"]}, {"type":"image_url", "image_url":{"url":f"data:image/jpeg;base64,{b64}"}}])
+            analysis_result = f"IMAGE ANALYSIS ({file_name}):\n{llm.invoke([msg]).content}"
+        
+        # Docs
         elif "pdf" in file_type:
             pdf = pypdf.PdfReader(io.BytesIO(file_bytes))
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-            analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"        
-        # GUARANTEE LIST
+            analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"
+            
+        elif "word" in file_type or "document" in file_type:
+             doc = docx.Document(io.BytesIO(file_bytes))
+             text = "\n".join([p.text for p in doc.paragraphs])
+             analysis_result = f"FILE TEXT ({file_name}):\n{text[:4000]}"
+
+        # Important: Return a list even if it's one item
         return {"context_data": [analysis_result] if analysis_result else []}
         
     except Exception as e:
-        return {"context_data": [f"Evidence Auditor Error: {e}"]} # List
+        return {"context_data": [f"Evidence Auditor Error: {e}"]}
 
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
-    # JOIN LIST safely
+    
+    # Safe join because crash_proof_reducer ensures this is always a list
     context_list = state.get('context_data', [])
     combined_context = "\n\n".join(context_list) if context_list else "No evidence found."
     
