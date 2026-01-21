@@ -17,7 +17,7 @@ from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 
-# --- EMERGENCY FIX: BYPASS SEARCH IF MISSING ---
+# --- EMERGENCY FIX: BYPASS SEARCH TO PREVENT CRASH ---
 try:
     from langchain_community.tools import DuckDuckGoSearchRun
     SEARCH_AVAILABLE = True
@@ -25,7 +25,7 @@ except ImportError:
     SEARCH_AVAILABLE = False
     logging.warning("⚠️ Live Search disabled (Dependency missing).")
 
-# --- 1. CONFIGURATION & LOGGING ---
+# --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("JustitiaBackend")
 
@@ -44,10 +44,7 @@ PROMPTS = {
     "senior_counsel": """
         You are 'Justitia', an AI Legal Co-Counsel.
         USER CONVERSATION: {history}
-        
-        COMBINED EVIDENCE & RESEARCH:
-        {context}
-        
+        EVIDENCE & RESEARCH: {context}
         INSTRUCTIONS: 
         1. Answer the legal query directly.
         2. IF 'LIVE WEB UPDATES' contradicts 'LEGAL PRECEDENTS', prioritize Live Updates.
@@ -89,13 +86,10 @@ def get_ai_tools():
     except: client.create_collection("response_cache", vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE))
     encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
     
-    # Safe Search Tool Init
     web_search = None
     if SEARCH_AVAILABLE:
-        try:
-            web_search = DuckDuckGoSearchRun()
-        except Exception:
-            web_search = None # Fallback if init fails
+        try: web_search = DuckDuckGoSearchRun()
+        except: web_search = None
 
     return llm, client, encoder, web_search
 
@@ -125,6 +119,7 @@ def store_in_cache(query: str, answer: str, sensitive_mode: bool = False):
 # --- 5. STATE ---
 class AgentState(TypedDict):
     messages: List[str]
+    # Uses operator.add to merge parallel outputs
     context_data: Annotated[List[str], operator.add] 
     file_data: Optional[Dict[str, Any]]
     is_incognito: bool
@@ -158,7 +153,6 @@ def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
         return {"context_data": [f"Legal Clerk Error: {e}"]}
 
 def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
-    """Safe Watchdog: Returns empty list if tool is missing."""
     if not web_search: return {"context_data": []}
     if not state.get('messages'): return {"context_data": []}
     
@@ -167,15 +161,16 @@ def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
         res = web_search.invoke(f"latest legal amendments supreme court judgments {query} India 2024 2025")
         return {"context_data": [f"LIVE WEB UPDATES:\n{res}"]}
     except Exception:
-        return {"context_data": []} # Fail silently
+        return {"context_data": []}
 
 def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
     file_data = state.get("file_data")
     if not file_data: return {"context_data": []}
     
-    # --- CRITICAL FIX: Handle NoneType in file_type safely ---
+    # --- CRITICAL FIX: Safe Get with Fallback ---
+    # This prevents "NoneType is not iterable" if type is None
     file_name = file_data.get("name", "").lower()
-    file_type = file_data.get("type", "") or "" # Converts None to ""
+    file_type = file_data.get("type", "") or "" 
     file_bytes = file_data.get("bytes")
 
     try:
@@ -207,9 +202,8 @@ def evidence_auditor(state: AgentState) -> Dict[str, List[str]]:
 def senior_counsel(state: AgentState) -> Dict[str, List[str]]:
     history = state.get('messages', [])
     
-    # --- CRITICAL FIX: Handle NoneType in context_data safely ---
+    # --- CRITICAL FIX: Handle None Context ---
     raw_context = state.get('context_data')
-    # Force it to be a list if it's None
     context_list = raw_context if isinstance(raw_context, list) else []
     
     combined_context = "\n\n".join(context_list) if context_list else "No evidence found."

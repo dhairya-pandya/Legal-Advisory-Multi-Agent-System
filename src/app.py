@@ -141,8 +141,8 @@ def main():
         # Inject the privacy flag into the state
         inputs = {
             "messages": chat_history,
-            "is_incognito": is_incognito,
-            "context_data": []    # <--- CRITICAL: Initialized Empty List for Parallel Agents
+            "is_incognito": is_incognito,  # <--- COMMA ADDED
+            "context_data": []             # <--- INITIALIZED EMPTY LIST
         }
         
         if file_val:
