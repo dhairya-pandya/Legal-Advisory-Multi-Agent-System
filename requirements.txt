@@ -15,4 +15,4 @@ python-docx
 tenacity
 flashrank
 langdetect
-#duckduckgo-search>=5.0
+duckduckgo-search

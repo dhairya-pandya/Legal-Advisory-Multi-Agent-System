@@ -17,7 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 from langchain_community.tools import DuckDuckGoSearchRun
-
+from duckduckgo_search import DDGS
 # --- 1. CONFIGURATION & LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("JustitiaBackend")
@@ -162,30 +162,46 @@ def legal_clerk(state: AgentState) -> Dict[str, List[str]]:
     except Exception as e:
         return {"context_data": [f"Legal Clerk Error: {e}"]}
 
+def query_duckduckgo(query: str, max_results: int = 3) -> str:
+    """
+    Directly queries DuckDuckGo without LangChain wrappers.
+    """
+    try:
+        with DDGS() as ddgs:
+            # .text() returns a list of dictionaries [{'title':..., 'body':...}]
+            results = [r for r in ddgs.text(query, max_results=max_results)]
+            
+            if not results:
+                return "No results found on the web."
+                
+            # Format nicely for the LLM
+            formatted = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+            return formatted
+    except Exception as e:
+        return f"Search Error: {e}"
+
+# --- UPDATED AGENT ---
 def amendment_watchdog(state: AgentState) -> Dict[str, List[str]]:
     """
-    Agent E: SMART Watchdog.
-    1. Identifies important fields using LLM.
-    2. Searches Web with optimized keywords.
+    Agent E: SMART Watchdog (Native Implementation).
     """
     if not state.get('messages'): return {"context_data": []}
     
     query = state['messages'][-1].split("User: ")[-1]
     
     try:
-        # STEP 1: Identify Important Fields (Extraction)
+        # STEP 1: Identify Fields (Same as before)
         extraction_prompt = PROMPTS["field_extraction"].format(query=query)
         extracted_fields = llm.invoke(extraction_prompt).content
         
-        # STEP 2: Construct Search Query from Fields
-        # We perform a "Cleaning" step to strip the labels for the search engine
+        # STEP 2: Clean Query
         search_terms = extracted_fields.replace("KEYWORDS:", "").replace("ACTS:", "").replace("YEARS:", "").replace("\n", " ")
         final_search_query = f"{search_terms} latest supreme court judgments amendments India"
         
-        # STEP 3: Execute Search
-        live_results = web_search.invoke(final_search_query)
+        # STEP 3: Execute Search (Using NEW Native Function)
+        live_results = query_duckduckgo(final_search_query)
         
-        return {"context_data": [f"LIVE WEB UPDATES (Extracted & Searched):\nFields Identified: {extracted_fields}\nResults: {live_results}"]}
+        return {"context_data": [f"LIVE WEB UPDATES (Watchdog):\nFields: {extracted_fields}\nResults: {live_results}"]}
         
     except Exception as e:
         return {"context_data": [f"Watchdog Error: {e}"]}
