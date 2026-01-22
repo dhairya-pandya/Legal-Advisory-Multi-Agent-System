@@ -4,7 +4,7 @@ from langchain_core.messages import HumanMessage
 from agents import app as agent_app, llm
 
 # --- 1. CONFIGURATION ---
-PAGE_TITLE = "Justitia AI"
+PAGE_TITLE = "NyayaSetu AI"
 PAGE_ICON = "⚖️"
 SUPPORTED_FILES = ["png", "jpg", "jpeg", "pdf", "docx", "mp3", "wav", "mp4", "mov", "avi", "mkv"]
 
@@ -107,7 +107,7 @@ def main():
     # A. Render Layout
     c1, c2 = st.columns([1, 8])
     with c1: st.image("https://cdn-icons-png.flaticon.com/512/924/924915.png", width=60)
-    with c2: st.title("Justitia: AI Legal Co-Counsel")
+    with c2: st.title("NyayaSetu: AI Legal Co-Counsel")
     
     # Capture Inputs (including Incognito flag)
     audio_val, file_val, is_incognito = render_sidebar()
@@ -122,13 +122,11 @@ def main():
     if audio_val:
         transcription = process_voice_input(audio_val)
         if transcription: final_input = transcription
-    
-    # Priority 2: Text (Only if no voice)
+
     if not final_input:
         text_val = st.chat_input("Describe your legal issue...")
         if text_val: final_input = text_val
 
-    # C. Processing Logic
     if final_input:
         # 1. Update UI immediately
         st.session_state["messages"].append({"role": "user", "content": final_input})
@@ -142,7 +140,7 @@ def main():
         inputs = {
             "messages": chat_history,
             "is_incognito": is_incognito,
-            "context_data": "" # <--- Simple String Initialization
+            "context_data": "" 
         }
         
         if file_val:
@@ -155,7 +153,7 @@ def main():
 
         # 3. Stream Agents
         with st.chat_message("assistant"):
-            with st.spinner("Justitia is thinking..."):
+            with st.spinner("NyayaSetu is thinking..."):
                 final_res = ""
                 try:
                     for output in agent_app.stream(inputs):

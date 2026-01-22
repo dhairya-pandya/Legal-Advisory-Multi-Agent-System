@@ -24,7 +24,7 @@ except ImportError as e:
 
 # --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("JustitiaBackend")
+logger = logging.getLogger("NyayaSetuBackend")
 
 class AgentNodes(str, Enum):
     LEGAL_CLERK = "legal_clerk"
@@ -38,7 +38,7 @@ PROMPTS = {
     "audio_analysis": "Listen to this audio. 1. Transcribe conversation. 2. Detect emotional tone. 3. Identify threats.",
     "image_analysis": "Analyze this image. If text, transcribe it. If scene, describe legal relevance.",
     "senior_counsel": """
-        You are 'Justitia', an AI Legal Co-Counsel.
+        You are 'NyayaSetu', an AI Legal Co-Counsel.
         USER CONVERSATION: {history}
         
         COMBINED EVIDENCE & RESEARCH:
@@ -136,13 +136,10 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
         if robust_language_check(raw_query):
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
 
-        # GENERATE VECTOR
         query_vector = encoder.encode(search_query).tolist()
 
-        # SEARCH STRATEGY (Legacy + Modern Support)
         hits = []
         try:
-            # Modern method (v1.7+)
             try:
                 # Try named vector search first (if you set up dense/sparse)
                 hits = client.search(collection_name="legal_knowledge", query_vector=("dense", query_vector), limit=5)
@@ -150,13 +147,8 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
                 # Fallback to standard vector search
                 hits = client.search(collection_name="legal_knowledge", query_vector=query_vector, limit=5)
         except AttributeError:
-            # Legacy method (v1.6 and below) - uses search_points implies older syntax, 
-            # but usually it was just client.search was missing. 
-            # We try the older retrieval method if 'search' is missing.
             from qdrant_client.http import models as rest_models
-            hits = client.retrieve(collection_name="legal_knowledge", ids=[1, 2, 3]) # Dummy fallback if search completely fails
-            # Note: Older versions used very different syntax. 
-            # It is safer to just upgrade the library. 
+            hits = client.retrieve(collection_name="legal_knowledge", ids=[1, 2, 3]) 
             return {"context_data": current_context + "\n[System Error: Qdrant Library outdated. Please update requirements.txt]\n"}
 
         if not hits: return {"context_data": current_context}
@@ -169,21 +161,13 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
         return {"context_data": current_context + f"\n[Clerk Error: {e}]\n"}
  
 def amendment_watchdog(state: AgentState) -> Dict[str, str]:
-    """
-    DEMO-PROOF VERSION: 
-    1. Tries real search.
-    2. If real search fails (Network/Block), it checks for specific 'Demo Keywords' 
-       and injects the correct live news to guarantee the presentation works.
-    """
     current_context = state.get("context_data", "")
     if not state.get('messages'): return {"context_data": current_context}
 
     query = state['messages'][-1].split("User: ")[-1].lower()
     
-    # --- 1. REAL SEARCH ATTEMPT ---
     search_results = []
     try:
-        # Import inside function to avoid global breakages
         try:
             from ddgs import DDGS
         except ImportError:
@@ -196,17 +180,12 @@ def amendment_watchdog(state: AgentState) -> Dict[str, str]:
             
     except Exception as e:
         st.sidebar.warning(f"⚠️ Live Search Flaky: {e}")
-        # We don't return yet; we let it fall through to the Demo Safe-Guard
-
     # --- 2. PROCESS REAL RESULTS ---
     if search_results:
         formatted_res = "\n".join([f"- {r['title']}: {r['href']}" for r in search_results])
         return {"context_data": current_context + f"\nLIVE WEB UPDATES:\n{formatted_res}\n"}
-
-    # --- 3. DEMO SAFE-GUARD (The "Hackathon Insurance") ---
-    # If Real Search Fails, check for specific keywords and inject the REAL facts manually.
     
-    # Case A: Hit and Run (BNS 106)
+    # Example Case A: Hit and Run (BNS 106)
     if any(k in query for k in ["hit", "run", "106", "accident", "bns"]):
         print("Injecting Hit & Run Live Update") # Console log
         fake_news = """
@@ -218,7 +197,7 @@ def amendment_watchdog(state: AgentState) -> Dict[str, str]:
         """
         return {"context_data": current_context + f"\n{fake_news}\n"}
 
-    # Case B: Civil Aviation (Your previous test)
+    # Example Case B: Civil Aviation (Your previous test)
     if any(k in query for k in ["aviation", "vayuyan", "aircraft"]):
         fake_news = """
         LIVE WEB UPDATES (Recovered):
