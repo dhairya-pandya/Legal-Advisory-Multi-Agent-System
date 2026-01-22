@@ -1,4 +1,4 @@
-qdrant-client
+qdrant-client>=1.9.0
 langchain
 langchain-community
 langchain-core

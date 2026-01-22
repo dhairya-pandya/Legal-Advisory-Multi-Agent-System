@@ -136,13 +136,28 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
         if robust_language_check(raw_query):
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
 
-        # TARGETED SEARCH (DENSE VECTOR)
+        # GENERATE VECTOR
+        query_vector = encoder.encode(search_query).tolist()
+
+        # SEARCH STRATEGY (Legacy + Modern Support)
+        hits = []
         try:
-             # Try searching specifically in "dense" vector first
-            hits = client.search(collection_name="legal_knowledge", query_vector=("dense", encoder.encode(search_query).tolist()), limit=5)
-        except:
-            # Fallback to default unnamed vector
-            hits = client.search(collection_name="legal_knowledge", query_vector=encoder.encode(search_query).tolist(), limit=5)
+            # Modern method (v1.7+)
+            try:
+                # Try named vector search first (if you set up dense/sparse)
+                hits = client.search(collection_name="legal_knowledge", query_vector=("dense", query_vector), limit=5)
+            except:
+                # Fallback to standard vector search
+                hits = client.search(collection_name="legal_knowledge", query_vector=query_vector, limit=5)
+        except AttributeError:
+            # Legacy method (v1.6 and below) - uses search_points implies older syntax, 
+            # but usually it was just client.search was missing. 
+            # We try the older retrieval method if 'search' is missing.
+            from qdrant_client.http import models as rest_models
+            hits = client.retrieve(collection_name="legal_knowledge", ids=[1, 2, 3]) # Dummy fallback if search completely fails
+            # Note: Older versions used very different syntax. 
+            # It is safer to just upgrade the library. 
+            return {"context_data": current_context + "\n[System Error: Qdrant Library outdated. Please update requirements.txt]\n"}
 
         if not hits: return {"context_data": current_context}
 
