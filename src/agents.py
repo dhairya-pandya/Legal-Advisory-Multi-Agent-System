@@ -17,7 +17,7 @@ try:
     from qdrant_client import QdrantClient, models
     from sentence_transformers import SentenceTransformer
     # Direct import for stability
-    from duckduckgo_search import DDGS 
+    from ddgs import DDGS
 except ImportError as e:
     st.error(f"❌ Missing Dependency: {e}. Please check requirements.txt")
     st.stop()
