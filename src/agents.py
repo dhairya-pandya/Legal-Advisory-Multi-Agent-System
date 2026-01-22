@@ -155,36 +155,67 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
  
 def amendment_watchdog(state: AgentState) -> Dict[str, str]:
     """
-    UPDATED: Implements a 'Broad Fallback' search strategy.
+    PRODUCTION VERSION: Uses Iterative Search Strategy to find live data.
     """
     current_context = state.get("context_data", "")
-    if not state.get('messages'): return {"context_data": current_context}
+    # Check if we have messages to process
+    if not state.get('messages'): 
+        return {"context_data": current_context}
 
+    # Extract user query
     query = state['messages'][-1].split("User: ")[-1]
     
+    # 1. ROBUST LIBRARY IMPORT
+    # This block handles the renaming confusion between 'ddgs' and 'duckduckgo_search'
+    DDGS_Class = None
     try:
-        # Direct usage of DuckDuckGo Search
-        with DDGS() as ddgs:
-            # ATTEMPT 1: Strict Legal Search
-            search_term_strict = f"latest supreme court judgment {query} India 2024 2025"
-            results = list(ddgs.text(search_term_strict, max_results=3))
-            
-            # ATTEMPT 2: Broad News Search (Fallback if Attempt 1 fails)
-            if not results:
-                search_term_broad = f"{query} India legal news update 2024"
-                results = list(ddgs.text(search_term_broad, max_results=3))
+        from duckduckgo_search import DDGS
+        DDGS_Class = DDGS
+    except ImportError:
+        try:
+            from ddgs import DDGS
+            DDGS_Class = DDGS
+        except ImportError:
+            st.error("❌ Search Library Missing. Please run: pip install duckduckgo-search")
+            return {"context_data": current_context + "\n[System: Live Search Module Missing]\n"}
 
-            if not results:
-                # If both fail, we don't break the chain, just add a note
-                return {"context_data": current_context + "\nLIVE WEB UPDATES: Search completed. No immediate recent rulings found."}
+    # 2. ITERATIVE SEARCH STRATEGY
+    # We define 3 distinct search angles. We stop as soon as we get good results.
+    search_attempts = [
+        # Angle 1: Strict Legal Precedents
+        f"Supreme Court of India judgment {query} 2024 2025",
+        # Angle 2: Legislative Acts & Bills (Good for 'Civil Aviation Act')
+        f"India new bill act law {query} 2024",
+        # Angle 3: General Legal News (Broadest net)
+        f"{query} India legal news update"
+    ]
 
-            formatted_res = "\n".join([f"- {r['title']}: {r['href']}" for r in results])
-            return {"context_data": current_context + f"\nLIVE WEB UPDATES:\n{formatted_res}\n"}
-            
+    found_results = []
+    
+    try:
+        with DDGS_Class() as ddgs:
+            for search_term in search_attempts:
+                # We limit to 3 results per attempt to keep it fast
+                results = list(ddgs.text(search_term, max_results=3))
+                
+                if results:
+                    found_results = results
+                    break # Stop searching if we found something useful
+
+        # 3. PROCESS RESULTS
+        if not found_results:
+            # If all 3 attempts failed, we honestly say so.
+            return {"context_data": current_context + f"\nLIVE WEB UPDATES: Searched for '{query}' but found no recent specific legal updates.\n"}
+
+        # Format the output cleanly
+        formatted_res = "\n".join([f"- [{r['title']}]({r['href']}): {r['body'][:200]}..." for r in found_results])
+        return {"context_data": current_context + f"\nLIVE WEB UPDATES (Source: DuckDuckGo):\n{formatted_res}\n"}
+
     except Exception as e:
-        # Graceful fallback so the app doesn't crash
-        return {"context_data": current_context + f"\n[Watchdog Warning: Live search unavailable ({str(e)})]\n"}
-
+        # 4. EXCEPTION HANDLING
+        # Log the specific error to the UI sidebar so you can debug network issues
+        st.sidebar.warning(f"⚠️ Live Search Connection Error: {e}")
+        return {"context_data": current_context + "\n[System: Live verification failed due to network error]\n"}
 def evidence_auditor(state: AgentState) -> Dict[str, str]:
     current_context = state.get("context_data", "")
     file_data = state.get("file_data")
