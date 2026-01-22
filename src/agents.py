@@ -16,21 +16,11 @@ try:
     from langchain_core.messages import HumanMessage
     from qdrant_client import QdrantClient, models
     from sentence_transformers import SentenceTransformer
+    # Direct import for stability
+    from duckduckgo_search import DDGS 
 except ImportError as e:
-    st.error(f"❌ Missing Dependency: {e}. Please update requirements.txt")
+    st.error(f"❌ Missing Dependency: {e}. Please check requirements.txt")
     st.stop()
-
-# --- SEARCH BYPASS (PREVENTS CRASH IF LIBRARY MISSING) ---
-SEARCH_AVAILABLE = False
-web_search = None
-try:
-    from langchain_community.tools import DuckDuckGoSearchRun
-    # Try initializing to catch internal errors early
-    _test = DuckDuckGoSearchRun()
-    SEARCH_AVAILABLE = True
-except Exception as e:
-    logging.warning(f"⚠️ Live Search disabled: {e}")
-    SEARCH_AVAILABLE = False
 
 # --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
@@ -97,18 +87,12 @@ def get_ai_tools():
     try: client.get_collection("response_cache")
     except: client.create_collection("response_cache", vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE))
     
-    # Check cache for model to avoid redownloading
     encoder = SentenceTransformer(CREDS["EMBEDDING_MODEL"])
 
-    search_tool = None
-    if SEARCH_AVAILABLE:
-        try: search_tool = DuckDuckGoSearchRun()
-        except: pass
-
-    return llm, client, encoder, search_tool
+    return llm, client, encoder
 
 # Initialize Global Tools
-llm, client, encoder, web_search = get_ai_tools()
+llm, client, encoder = get_ai_tools()
 
 # --- 4. HELPERS ---
 def robust_language_check(text: str) -> bool:
@@ -152,10 +136,8 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
             search_query = llm.invoke(PROMPTS["translation"].format(query=raw_query)).content.strip()
 
         # TARGETED SEARCH (DENSE VECTOR)
-        # Note: We use search() method to be safe with named vectors if they exist, 
-        # or fallback to default if your setup changed.
         try:
-             # Try searching specifically in "dense" vector first (based on your previous screenshot)
+             # Try searching specifically in "dense" vector first
             hits = client.search(collection_name="legal_knowledge", query_vector=("dense", encoder.encode(search_query).tolist()), limit=5)
         except:
             # Fallback to default unnamed vector
@@ -171,16 +153,30 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
         return {"context_data": current_context + f"\n[Clerk Error: {e}]\n"}
 
 def amendment_watchdog(state: AgentState) -> Dict[str, str]:
+    """
+    FIXED: Uses DDGS directly instead of LangChain wrapper to avoid ImportErrors.
+    """
     current_context = state.get("context_data", "")
-    if not web_search: return {"context_data": current_context}
     if not state.get('messages'): return {"context_data": current_context}
 
     query = state['messages'][-1].split("User: ")[-1]
+    
     try:
-        res = web_search.invoke(f"latest legal amendments supreme court judgments {query} India 2024 2025")
-        return {"context_data": current_context + f"\nLIVE WEB UPDATES:\n{res}\n"}
-    except Exception:
-        return {"context_data": current_context}
+        # Direct usage of DuckDuckGo Search (More reliable)
+        with DDGS() as ddgs:
+            # We specifically look for Indian legal updates
+            search_term = f"latest supreme court judgment {query} India 2024 2025"
+            results = list(ddgs.text(search_term, max_results=3))
+            
+            if not results:
+                return {"context_data": current_context + "\nLIVE WEB UPDATES: No recent updates found."}
+
+            formatted_res = "\n".join([f"- {r['title']}: {r['href']}" for r in results])
+            return {"context_data": current_context + f"\nLIVE WEB UPDATES:\n{formatted_res}\n"}
+            
+    except Exception as e:
+        # Graceful fallback so the app doesn't crash
+        return {"context_data": current_context + f"\n[Watchdog Warning: Live search unavailable ({str(e)})]\n"}
 
 def evidence_auditor(state: AgentState) -> Dict[str, str]:
     current_context = state.get("context_data", "")
