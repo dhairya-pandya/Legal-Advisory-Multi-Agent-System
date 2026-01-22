@@ -46,9 +46,10 @@ PROMPTS = {
         
         INSTRUCTIONS: 
         1. Answer the legal query directly.
-        2. IF 'LIVE WEB UPDATES' contradicts 'LEGAL PRECEDENTS', prioritize Live Updates.
-        3. Cite specific sections.
-        4. Output in English.
+        2. IF 'LIVE WEB UPDATES' are found, prioritize them over static laws.
+        3. IF NO CONTEXT IS FOUND: You represent a fallback mechanism. Answer based on your general legal knowledge but explicitly state: "Note: Live verification was unavailable. This advice is based on general legal principles."
+        4. Cite specific sections if known.
+        5. Output in English.
     """
 }
 
@@ -151,10 +152,10 @@ def legal_clerk(state: AgentState) -> Dict[str, str]:
         
     except Exception as e:
         return {"context_data": current_context + f"\n[Clerk Error: {e}]\n"}
-
+ 
 def amendment_watchdog(state: AgentState) -> Dict[str, str]:
     """
-    FIXED: Uses DDGS directly instead of LangChain wrapper to avoid ImportErrors.
+    UPDATED: Implements a 'Broad Fallback' search strategy.
     """
     current_context = state.get("context_data", "")
     if not state.get('messages'): return {"context_data": current_context}
@@ -162,14 +163,20 @@ def amendment_watchdog(state: AgentState) -> Dict[str, str]:
     query = state['messages'][-1].split("User: ")[-1]
     
     try:
-        # Direct usage of DuckDuckGo Search (More reliable)
+        # Direct usage of DuckDuckGo Search
         with DDGS() as ddgs:
-            # We specifically look for Indian legal updates
-            search_term = f"latest supreme court judgment {query} India 2024 2025"
-            results = list(ddgs.text(search_term, max_results=3))
+            # ATTEMPT 1: Strict Legal Search
+            search_term_strict = f"latest supreme court judgment {query} India 2024 2025"
+            results = list(ddgs.text(search_term_strict, max_results=3))
             
+            # ATTEMPT 2: Broad News Search (Fallback if Attempt 1 fails)
             if not results:
-                return {"context_data": current_context + "\nLIVE WEB UPDATES: No recent updates found."}
+                search_term_broad = f"{query} India legal news update 2024"
+                results = list(ddgs.text(search_term_broad, max_results=3))
+
+            if not results:
+                # If both fail, we don't break the chain, just add a note
+                return {"context_data": current_context + "\nLIVE WEB UPDATES: Search completed. No immediate recent rulings found."}
 
             formatted_res = "\n".join([f"- {r['title']}: {r['href']}" for r in results])
             return {"context_data": current_context + f"\nLIVE WEB UPDATES:\n{formatted_res}\n"}
