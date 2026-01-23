@@ -5,7 +5,7 @@ from agents import app as agent_app, llm
 
 # --- 1. CONFIGURATION ---
 PAGE_TITLE = "NyayaSetu AI"
-PAGE_ICON = "⚖️"
+PAGE_ICON = "logo.png"
 SUPPORTED_FILES = ["png", "jpg", "jpeg", "pdf", "docx", "mp3", "wav", "mp4", "mov", "avi", "mkv"]
 
 st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
@@ -106,7 +106,7 @@ def render_translation_tools():
 def main():
     # A. Render Layout
     c1, c2 = st.columns([1, 8])
-    with c1: st.image("https://cdn-icons-png.flaticon.com/512/924/924915.png", width=60)
+    with c1: st.image("logo.png", width=60)
     with c2: st.title("NyayaSetu: AI Legal Co-Counsel")
     
     # Capture Inputs (including Incognito flag)
